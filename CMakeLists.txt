@@ -46,6 +46,13 @@ add_executable(hft_tests
 target_link_libraries(hft_tests PRIVATE hft_core)
 target_include_directories(hft_tests PRIVATE tests)
 
+# Benchmark executable
+add_executable(hft_benchmark
+    benchmarks/benchmark.cpp
+)
+target_link_libraries(hft_benchmark PRIVATE hft_core)
+
 # Enable CTest integration
 enable_testing()
 add_test(NAME CoreUnitAndDeterminismTests COMMAND hft_tests)
+
