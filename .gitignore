@@ -1,0 +1,39 @@
+# CMake build artifacts
+build/
+build-*/
+out/
+CMakeSettings.json
+CMakeUserPresets.json
+
+# Visual Studio & MSVC files
+.vs/
+*.sln
+*.vcxproj*
+*.user
+*.suo
+x64/
+x86/
+Debug/
+Release/
+*.dir/
+
+# Compiled objects and binaries
+*.obj
+*.o
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.a
+*.dll
+
+# IDE and Editor directories
+.idea/
+.vscode/
+*.swp
+*~
+
+# Scratch & temporary profiling output
+scratch/
+*.profdata
+*.profraw
