@@ -195,3 +195,102 @@ Verified:
 ### 8.10 Why the Final Decision Was Made
 The benchmark data provides clear evidence: `FlatOrderBook` improves MATCH-heavy (+8% to +22%), CANCEL-heavy (+18% to +35%), and MIXED (+2% to +10%) across realistic scale, while cutting dynamic allocations by 36% to 48% across workloads. Keeping both implementations preserves architectural honesty and gives full visibility into the trade-off between cache locality ($O(1)/O(\log K)$) and dense vector shifting ($O(K)$).
 
+---
+
+## 9. Phase 5 — SPSC Lock-Free Event Pipeline
+
+### 9.1 Motivation: Why SPSC?
+In production exchange and trading architectures, network adapters / feed handlers receive order events asynchronously from external connections. To achieve ultra-low latency:
+1. The core matching engine must **never block** on network I/O or mutex contention.
+2. The matching engine must remain strictly **single-threaded** to eliminate locks, race conditions, and non-deterministic concurrency bugs.
+A Single-Producer / Single-Consumer (SPSC) lock-free bounded queue provides the optimal, wait-free thread boundary: exactly one external producer thread deposits events, and exactly one consumer thread owns and executes the matching engine.
+
+### 9.2 Strict Ownership Model
+```
+[Producer Thread] ──(try_push)──► [SpscQueue<OrderEvent>] ──(try_pop)──► [Consumer Thread] ──► [MatchingEngine]
+```
+- **Consumer Thread**: Sole owner of `MatchingEngine`, `OrderBook`, `OrderPool`, and price-level state. Only the consumer thread invokes order placement, matching, cancellation, and modification.
+- **Producer Thread**: Strictly forbidden from touching or reading matching engine state. Interacts solely with the thread-safe SPSC queue boundary.
+- **Matching Engine**: Contains zero mutexes, zero internal synchronization, and zero locking overhead.
+
+### 9.3 Event & Queue Layout
+- **`OrderEvent` (32 Bytes)**:
+  - Trivially copyable, standard layout struct fitting exactly 2 events per 64-byte hardware cache line.
+  - Fields: `type` (1B), `side` (1B), `pad` (6B), `id` (8B), `price` (8B), `qty` (8B).
+  - No strings, vectors, virtual functions, or heap pointers.
+- **`SpscQueue<T, Capacity, CacheAligned>`**:
+  - Power-of-two bounded ring buffer with single-cycle bitwise masking (`index & (Capacity - 1)`).
+  - Preallocated buffer array (0 allocations during operation).
+  - Explicit queue-full policy: `try_push()` returns `false` without overwriting unread events or blocking.
+
+### 9.4 Memory Ordering Strategy
+Sequential consistency (`memory_order_seq_cst`) is strictly avoided on the hot path in favor of tailored Acquire-Release semantics and local index caching:
+1. **Producer (`try_push`)**:
+   - Reads `head_` with `std::memory_order_relaxed`.
+   - Checks fullness against local `cached_tail_`. If full, refreshes `cached_tail_` with `tail_.load(std::memory_order_acquire)`.
+   - Writes event into preallocated buffer.
+   - Commits write with `head_.store(head + 1, std::memory_order_release)`, establishing a happens-before relationship for buffer writes.
+2. **Consumer (`try_pop`)**:
+   - Reads `tail_` with `std::memory_order_relaxed`.
+   - Checks emptiness against local `cached_head_`. If empty, refreshes `cached_head_` with `head_.load(std::memory_order_acquire)`.
+   - Reads event from buffer.
+   - Commits read with `tail_.store(tail + 1, std::memory_order_release)`, ensuring the slot is not overwritten until reading finishes.
+
+### 9.5 Allocation Verification (Step 12)
+Active-window CRT allocation hooks verified that `try_push` and `try_pop` perform **0.00 dynamic heap allocations per event** across 200,000 continuous operations.
+
+### 9.6 Single-Threaded & Concurrent Correctness (Step 4 & 5)
+1. **Single-Threaded Unit Tests**: Passed 9 deterministic scenarios: empty pop, single push/pop, FIFO ordering, capacity fill & rejection, ring buffer wraparound, multiple wraparounds, alternating push/pop, and a 100,000-event sequence.
+2. **Concurrent 1P/1C Stress Test**: Transferred 2,000,000 events between dedicated concurrent producer and consumer threads. Zero lost events, zero duplicates, zero reorderings, zero data corruptions, zero deadlock.
+3. **Deterministic Pipeline Equivalence**: Passed 3 deterministic equivalence suites (seeds `0x12345678`, `0xCAFEBABE`, `0xDEADBEEF`), verifying that `Producer -> SPSC -> Consumer -> MatchingEngine` generates 100% bit-exact trade counts, prices, quantities, timestamps, order books, and structural invariants compared to direct synchronous execution.
+
+### 9.7 Queue Microbenchmark Results (Step 6 & 11)
+Measured 2,000,000 events transferred between concurrent threads:
+
+| Queue Type | Capacity | Elapsed (ms) | Throughput (M ev/s) | Avg Latency (ns) |
+| :--- | :--- | :--- | :--- | :--- |
+| **SPSC (Cache-Aligned)** | 256 | 56.80 ms | **35.21 M ev/s** | 28.4 ns |
+| SPSC (Unaligned) | 256 | 103.57 ms | 19.31 M ev/s | 51.8 ns |
+| `std::mutex + queue` | 256 | 139.72 ms | 14.31 M ev/s | 69.9 ns |
+| **SPSC (Cache-Aligned)** | 1024 | 52.76 ms | **37.91 M ev/s** | 26.4 ns |
+| SPSC (Unaligned) | 1024 | 101.09 ms | 19.78 M ev/s | 50.5 ns |
+| `std::mutex + queue` | 1024 | 123.30 ms | 16.22 M ev/s | 61.6 ns |
+| **SPSC (Cache-Aligned)** | 4096 | 46.75 ms | **42.78 M ev/s** | 23.4 ns |
+| SPSC (Unaligned) | 4096 | 115.87 ms | 17.26 M ev/s | 57.9 ns |
+| `std::mutex + queue` | 4096 | 129.06 ms | 15.50 M ev/s | 64.5 ns |
+| **SPSC (Cache-Aligned)** | 16384 | 41.65 ms | **48.02 M ev/s** | 20.8 ns |
+| SPSC (Unaligned) | 16384 | 101.45 ms | 19.71 M ev/s | 50.7 ns |
+| `std::mutex + queue` | 16384 | 98.37 ms | 20.33 M ev/s | 49.2 ns |
+
+#### False Sharing Impact (`alignas(64)`)
+Separating `head_` and `tail_` onto distinct 64-byte cache lines yielded a **+82% to +148% throughput increase** (e.g. 17.26 M &rarr; 42.78 M events/sec at capacity 4096). When unaligned, producer and consumer write-invalidations cause continuous cross-core L1 cache line bouncing (MESI invalidation ping-pong).
+
+#### CPU Thread Affinity Experiment (Step 10)
+- OS Default Scheduling: **42.31 M events/sec** (23.6 ns/event)
+- Pinned Scheduling (Cores 0 & 2): **33.88 M events/sec** (29.5 ns/event, -19.9%)
+On hybrid Intel architectures (P-core/E-core), OS thread scheduling dynamically utilizes turbo performance cores, whereas static affinity masks can introduce core contention or scheduling sub-optimality.
+
+### 9.8 Pipeline Overhead Benchmark Results (Step 9)
+Measured Direct Synchronous Engine vs Threaded SPSC Pipeline (`MatchingEnginePipeline`):
+
+| Workload | Size | Direct Throughput | Pipeline Throughput | Producer Latency ($p50 / p99$) | Pipeline Boundary Cost |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **ADD-HEAVY** | 10K | 7.52 M/s | 4.96 M/s | 0 ns / 100 ns | +51.6% wall time |
+| **MATCH-HEAVY** | 10K | 17.13 M/s | 8.07 M/s | 0 ns / 100 ns | +112.3% wall time |
+| **CANCEL-HEAVY**| 10K | 9.70 M/s | 6.77 M/s | 0 ns / 100 ns | +43.3% wall time |
+| **MIXED** | 10K | 14.71 M/s | 9.36 M/s | 0 ns / 100 ns | +57.2% wall time |
+| **ADD-HEAVY** | 100K | 6.09 M/s | 5.49 M/s | 0 ns / 200 ns | +11.0% wall time |
+| **MATCH-HEAVY** | 100K | 13.45 M/s | 7.43 M/s | 0 ns / 200 ns | +81.2% wall time |
+| **CANCEL-HEAVY**| 100K | 6.84 M/s | 6.16 M/s | 0 ns / 300 ns | +11.1% wall time |
+| **MIXED** | 100K | 12.02 M/s | 9.50 M/s | 0 ns / 100 ns | +26.6% wall time |
+| **ADD-HEAVY** | 1M | 4.78 M/s | 3.74 M/s | 200 ns / 600 ns | +27.7% wall time |
+| **MATCH-HEAVY** | 1M | 6.80 M/s | 4.38 M/s | 200 ns / 600 ns | +55.1% wall time |
+| **CANCEL-HEAVY**| 1M | 6.20 M/s | 4.63 M/s | 200 ns / 500 ns | +34.0% wall time |
+| **MIXED** | 1M | 7.23 M/s | 5.10 M/s | 100 ns / 600 ns | +41.6% wall time |
+
+#### Analysis of Pipeline Boundary Overhead:
+1. **Producer Isolation**: The producer thread experiences near-zero enqueue latency ($p50 = 0\text{--}100 \text{ ns}, p99 = 100\text{--}600 \text{ ns}$) because it pushes to the preallocated SPSC ring buffer without waiting for order matching or trade event emission.
+2. **Boundary Overhead**: End-to-end throughput is 11% to 55% lower than direct execution due to cross-thread cache coherence migrations (moving 32-byte events across L2/L3 interconnect), atomic release/acquire barriers, and inter-thread yield/pause signaling when the queue empties.
+3. **Core Benefit**: In exchange for this well-characterized boundary cost, the engine achieves complete decoupling from external inputs while guaranteeing strict single-threaded determinism.
+
+

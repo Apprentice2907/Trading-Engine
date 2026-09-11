@@ -25,6 +25,7 @@ add_library(hft_core STATIC
     src/matching_engine.cpp
     src/flat_order_book.cpp
     src/flat_matching_engine.cpp
+    src/event_pipeline.cpp
     src/baseline/baseline_order_book.cpp
     src/baseline/baseline_matching_engine.cpp
 )
@@ -50,6 +51,8 @@ add_executable(hft_tests
     tests/test_differential.cpp
     tests/test_flat_order_book.cpp
     tests/test_differential_flat.cpp
+    tests/test_spsc_queue.cpp
+    tests/test_pipeline_equivalence.cpp
 )
 target_link_libraries(hft_tests PRIVATE hft_core)
 target_include_directories(hft_tests PRIVATE tests)
@@ -66,6 +69,18 @@ add_executable(price_level_benchmark
     benchmarks/price_level_benchmark.cpp
 )
 target_link_libraries(price_level_benchmark PRIVATE hft_core)
+
+# SPSC Queue microbenchmark executable
+add_executable(queue_benchmark
+    benchmarks/queue_benchmark.cpp
+)
+target_link_libraries(queue_benchmark PRIVATE hft_core)
+
+# Event pipeline benchmark executable
+add_executable(pipeline_benchmark
+    benchmarks/pipeline_benchmark.cpp
+)
+target_link_libraries(pipeline_benchmark PRIVATE hft_core)
 
 
 # Enable CTest integration
