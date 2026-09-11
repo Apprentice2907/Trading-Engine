@@ -2,64 +2,38 @@
 
 #include "hft/types.hpp"
 #include "hft/order.hpp"
-#include "hft/order_pool.hpp"
 
 #include <map>
 #include <unordered_map>
+#include <list>
 #include <vector>
 #include <optional>
 #include <string>
 
-namespace hft {
+namespace hft::baseline {
 
-/**
- * @brief Represents an aggregated price level with an intrusive FIFO queue of orders.
- */
 struct PriceLevel {
     Price price{0};
     Quantity total_quantity{0};
-    OrderIndex head{INVALID_INDEX};
-    OrderIndex tail{INVALID_INDEX};
-    size_t count{0};
+    std::list<Order> orders;
 };
 
-/**
- * @brief Lightweight snapshot of a price level for display and inspection.
- */
 struct LevelView {
     Price price{0};
     Quantity total_quantity{0};
     size_t order_count{0};
 };
 
-/**
- * @brief Memory-optimized deterministic Limit Order Book.
- *
- * Uses preallocated OrderPool storage to eliminate dynamic heap allocations per order,
- * while maintaining std::map price levels to isolate the memory optimization experiment.
- */
 class OrderBook {
-public:
-    explicit OrderBook(size_t initial_capacity = 65536)
-        : order_pool_(initial_capacity) {
-        order_lookup_.reserve(initial_capacity);
-    }
 
+public:
+    OrderBook() = default;
     ~OrderBook() = default;
 
-    // Non-copyable, movable
     OrderBook(const OrderBook&) = delete;
     OrderBook& operator=(const OrderBook&) = delete;
     OrderBook(OrderBook&&) noexcept = default;
     OrderBook& operator=(OrderBook&&) noexcept = default;
-
-    /**
-     * @brief Pre-reserves capacity for orders and hash lookup table to eliminate rehashing.
-     */
-    void reserve(size_t order_capacity) {
-        order_pool_.reserve(order_capacity);
-        order_lookup_.reserve(order_capacity);
-    }
 
     OrderResult add_resting_order(const Order& order);
     size_t match(Order& incoming, std::vector<Trade>& trades, uint64_t& trade_seq);
@@ -68,7 +42,6 @@ public:
     OrderResult modify(OrderId id, Price new_price, Quantity new_qty,
                        std::vector<Trade>& trades, uint64_t& trade_seq);
 
-    // Book state queries
     [[nodiscard]] bool has_order(OrderId id) const noexcept;
     [[nodiscard]] std::optional<Order> get_order(OrderId id) const;
 
@@ -86,31 +59,18 @@ public:
     [[nodiscard]] std::vector<LevelView> get_bid_levels() const;
     [[nodiscard]] std::vector<LevelView> get_ask_levels() const;
 
-    [[nodiscard]] const OrderPool& pool() const noexcept { return order_pool_; }
-
     [[nodiscard]] bool verify_invariants(std::string* error_out = nullptr) const;
 
 private:
     struct OrderLocation {
-        Side side{Side::Buy};
-        Price price{0};
-        OrderIndex pool_index{INVALID_INDEX};
+        Side side;
+        Price price;
+        std::list<Order>::iterator iter;
     };
 
-    void detach_order_from_level(PriceLevel& level, OrderIndex idx) noexcept;
-    void append_order_to_level(PriceLevel& level, OrderIndex idx) noexcept;
-
-    // Bids sorted descending
     std::map<Price, PriceLevel, std::greater<Price>> bids_;
-
-    // Asks sorted ascending
     std::map<Price, PriceLevel, std::less<Price>> asks_;
-
-    // Fast O(1) order lookup by OrderId
     std::unordered_map<OrderId, OrderLocation> order_lookup_;
-
-    // Preallocated contiguous order storage
-    OrderPool order_pool_;
 };
 
-} // namespace hft
+} // namespace hft::baseline

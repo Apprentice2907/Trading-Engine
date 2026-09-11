@@ -23,6 +23,8 @@ endif()
 add_library(hft_core STATIC
     src/order_book.cpp
     src/matching_engine.cpp
+    src/baseline/baseline_order_book.cpp
+    src/baseline/baseline_matching_engine.cpp
 )
 
 target_include_directories(hft_core PUBLIC
@@ -42,9 +44,12 @@ add_executable(hft_tests
     tests/test_order_book.cpp
     tests/test_matching_engine.cpp
     tests/test_determinism.cpp
+    tests/test_order_pool.cpp
+    tests/test_differential.cpp
 )
 target_link_libraries(hft_tests PRIVATE hft_core)
 target_include_directories(hft_tests PRIVATE tests)
+
 
 # Benchmark executable
 add_executable(hft_benchmark
