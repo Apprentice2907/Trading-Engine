@@ -30,7 +30,17 @@ add_library(hft_core STATIC
     src/event_replayer.cpp
     src/baseline/baseline_order_book.cpp
     src/baseline/baseline_matching_engine.cpp
+    src/broker/angel_decoder.cpp
+    src/broker/mock_angel_feed.cpp
+    src/broker/angel_client.cpp
+    src/market_data_pipeline.cpp
+    src/market_recorder.cpp
+    src/market_replayer.cpp
 )
+
+if (WIN32)
+    target_link_libraries(hft_core PUBLIC winhttp)
+endif()
 
 target_include_directories(hft_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -49,6 +59,12 @@ add_executable(hft_log_tool
 )
 target_link_libraries(hft_log_tool PRIVATE hft_core)
 
+# Market data CLI tool executable
+add_executable(hft_market_data
+    examples/hft_market_data.cpp
+)
+target_link_libraries(hft_market_data PRIVATE hft_core)
+
 # Automated test suite executable
 add_executable(hft_tests
     tests/main.cpp
@@ -62,6 +78,7 @@ add_executable(hft_tests
     tests/test_spsc_queue.cpp
     tests/test_pipeline_equivalence.cpp
     tests/test_binary_log.cpp
+    tests/test_angel_market_data.cpp
 )
 target_link_libraries(hft_tests PRIVATE hft_core)
 target_include_directories(hft_tests PRIVATE tests)
@@ -97,6 +114,11 @@ add_executable(replay_benchmark
 )
 target_link_libraries(replay_benchmark PRIVATE hft_core)
 
+# Market data benchmark executable
+add_executable(market_data_benchmark
+    benchmarks/market_data_benchmark.cpp
+)
+target_link_libraries(market_data_benchmark PRIVATE hft_core)
 
 # Enable CTest integration
 enable_testing()

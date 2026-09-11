@@ -425,5 +425,154 @@ Hardware: Intel Core i5-13420H (13th Gen), Windows 11, MSVC 19.44 /O2 Release.
 4. **Robust Corruption Rejection**:
    Header CRC32 and Payload CRC32 guarantee immediate, graceful rejection of corrupted files, flipped bits, truncated payloads, and incompatible versions without relying on C++ exceptions or risking undefined behavior.
 
+---
 
+## 11. Phase 7 — Angel One SmartAPI Live Market Data Integration
 
+### 11.1 Broker Selection & Free API Justification
+
+To incorporate real-time market data ingestion without recurring data subscription costs, **Angel One SmartAPI (SmartStream WebSocket 2.0)** was selected:
+- **Zero-Cost Developer Access**: Angel One provides free live market data access to developer accounts, unlike Zerodha Kite Connect whose free tier excludes real-time market data streaming.
+- **Binary Wire Protocol**: SmartStream 2.0 streams raw binary packets over WebSockets rather than bulky JSON or base64-encoded strings, aligning directly with low-latency C++ deserialization principles.
+- **Strict Read-Only Scope**: The adapter is architected strictly for market data consumption. Order execution endpoints (`placeOrder`, `cancelOrder`, `modifyOrder`) are deliberately omitted.
+
+> [!WARNING]
+> **Retail Broker Feed Reality Check**:
+> - This is a retail broker WebSocket feed delivered over public TLS/TCP Internet connections.
+> - It is **not** colocated exchange multicast infrastructure (such as NSE TAP/TBT tick-by-tick or ITCH/OUCH 10Gbps direct lines).
+> - Typical transit latencies across public retail WebSockets range from 15 to 50 milliseconds, which is 1,000x to 10,000x slower than institutional co-located microwave/direct cross-connect setups.
+
+---
+
+### 11.2 Architecture & Strict Separation of Concerns
+
+```
+[ EXTERNAL LIVE PATH ]
+Angel One SmartStream (wss://smartapisocket.angelone.in/smart-stream)
+                    │  (TLS 1.2/1.3 via WinHttpWebSocket)
+                    ▼
+     [AngelOneClient (Broker Adapter)]
+                    │  (Raw Little-Endian binary packets: Mode 1/2/3)
+                    ▼
+     [AngelDecoder (Zero-Allocation Parser)]
+                    │  (Normalized 128B MarketEvent)
+                    ▼
+  [SpscQueue<MarketEvent> (Lock-Free FIFO Queue)]
+                    │  (Non-blocking enqueue; drop counter on saturation)
+                    ▼
+          [Consumer Worker Thread]
+            ├──► Live Observer (Top-of-book, Spread, Depth display)
+            └──► MarketEventRecorder (.mktlog binary journal)
+
+[ REPLAY / SIMULATION PATH ]
+       .mktlog Binary Journal / MockAngelFeed
+                    │
+                    ▼
+          [MarketEventReplayer] ──► SpscQueue<MarketEvent> ──► Engine Pipeline
+```
+
+#### Invariant: Market Observations &ne; Exchange Orders
+Market data ticks represent **observations of external transactions**, NOT commands to place orders on our internal exchange. Feeding broker ticks directly into `MatchingEngine` as orders violates market integrity. Thus:
+- `MatchingEngine` processes `OrderEvent` (32 bytes, engine commands).
+- Market data adapter processes `MarketEvent` (128 bytes, external observations).
+- The two streams remain strictly segregated.
+
+---
+
+### 11.3 Binary Wire Protocol (Little-Endian)
+
+Angel One SmartStream sends compact binary frames in Little-Endian byte order:
+
+| Byte Offset | Size | Field | Type | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| **0** | 1 | `subscription_mode` | `uint8_t` | `1` = LTP (51B), `2` = Quote (147B), `3` = SnapQuote (347B) |
+| **1** | 1 | `exchange_type` | `uint8_t` | `1` = NSE_CM, `2` = NSE_FO, `3` = BSE_CM, `4` = BSE_FO, `5` = MCX_FO |
+| **2** | 25 | `token` | `char[25]` | Null-terminated string (e.g. `"3045\0..."`) |
+| **27** | 8 | `sequence_number` | `int64_t` | Exchange sequence number |
+| **35** | 8 | `exchange_timestamp` | `int64_t` | Provider timestamp in epoch milliseconds |
+| **43** | 8 | `last_traded_price` | `int64_t` | Price in discrete paise (1 INR = 100 paise) |
+| *(Offset 51)* | - | *(End of Mode 1 / LTP)* | - | Total size: 51 bytes |
+| **51** | 8 | `last_traded_quantity` | `int64_t` | Traded quantity of last execution |
+| **59** | 8 | `avg_traded_price` | `int64_t` | Day VWAP in paise |
+| **67** | 8 | `volume_for_day` | `int64_t` | Cumulative traded volume |
+| **75** | 8 | `total_buy_quantity` | `int64_t` | Cumulative open bid quantity |
+| **83** | 8 | `total_sell_quantity` | `int64_t` | Cumulative open ask quantity |
+| **91** | 8 | `open_price` | `int64_t` | Opening price in paise |
+| **99** | 8 | `high_price` | `int64_t` | Session high price in paise |
+| **107** | 8 | `low_price` | `int64_t` | Session low price in paise |
+| **115** | 8 | `close_price` | `int64_t` | Previous close price in paise |
+| *(Offset 147)* | - | *(End of Mode 2 / Quote)*| - | Total size: 147 bytes |
+| **147** | 100 | `best_5_bids` | `5 x 20B` | 5 Bid levels: Flag (2B), Qty (8B), Price (8B), Orders (2B) |
+| **247** | 100 | `best_5_asks` | `5 x 20B` | 5 Ask levels: Flag (2B), Qty (8B), Price (8B), Orders (2B) |
+| *(Offset 347)* | - | *(End of Mode 3 / SnapQuote)*| - | Total size: 347 bytes |
+
+---
+
+### 11.4 Normalized `MarketEvent` Representation
+
+To maintain cache locality, prevent unaligned memory penalties, and enable spatial prefetching, `MarketEvent` is laid out to fit **exactly two 64-byte hardware cache lines (128 bytes)**:
+
+```cpp
+struct alignas(64) MarketEvent {
+    // Cache Line 1 (Bytes 0 - 63)
+    uint32_t instrument_token{0};   // Numeric security token (4B)
+    uint8_t  exchange_type{0};      // Exchange identifier (1B)
+    uint8_t  subscription_mode{0};  // 1=LTP, 2=Quote, 3=SnapQuote (1B)
+    uint16_t pad{0};                // Header alignment padding (2B)
+    uint64_t sequence_number{0};    // Provider sequence counter (8B)
+    uint64_t exchange_timestamp{0}; // Provider timestamp in epoch nanoseconds (8B)
+    uint64_t receive_timestamp{0};  // Ingestion steady_clock in nanoseconds (8B)
+    int64_t  last_price{0};         // Last traded price in discrete ticks / paise (8B)
+    uint64_t last_quantity{0};      // Last traded volume (8B)
+    int64_t  best_bid_price{0};     // Top of book bid price in paise (8B)
+    uint64_t best_bid_quantity{0};  // Top of book resting bid quantity (8B)
+
+    // Cache Line 2 (Bytes 64 - 127)
+    int64_t  best_ask_price{0};     // Top of book ask price in paise (8B)
+    uint64_t best_ask_quantity{0};  // Top of book resting ask quantity (8B)
+    uint64_t volume{0};             // Cumulative session volume (8B)
+    uint8_t  reserved[40]{0};       // Spatial padding & future expansion (40B)
+};
+
+static_assert(sizeof(MarketEvent) == 128);
+static_assert(alignof(MarketEvent) == 64);
+static_assert(std::is_trivially_copyable_v<MarketEvent>);
+```
+
+---
+
+### 11.5 Binary `.mktlog` Storage & Replay
+
+The market data recording subsystem writes to a dedicated binary file format (`.mktlog`):
+- **Header**: 64 bytes (`magic = 0x4C544B4D` / `"MKTL"`, version 1, record size 128, event count, 32-bit CRC32 checksum of header and payload).
+- **Records**: Sequential 128-byte unpadded `MarketEvent` structs.
+- **I/O Amortization**: Double-buffered 64 KB memory staging buffer (~512 events per block) avoiding per-event write syscalls.
+- **Integrity**: Full IEEE 802.3 CRC32 verification detects any dropped, altered, or corrupted frames.
+
+---
+
+### 11.6 Empirical Benchmark Results
+
+Hardware: Intel Core i5-13420H (13th Gen, 8 cores / 12 threads), Windows 11, MSVC 19.50 /O2 Release.
+
+#### Dynamic Allocation Audit
+- **Hot-Path Allocations**: **0.00 allocs/event** (0 dynamic heap allocations across 50,000 consecutive decode & SPSC push/pop operations).
+
+#### Multi-Scale Benchmark Matrix
+| Scale | Subsystem / Operation | Throughput | Latency | Bandwidth / Density |
+| :--- | :--- | :--- | :--- | :--- |
+| **100,000** | **Decode & Normalization** | **13.69 M packets/s** | **73.0 ns** (p50: 0.0 ns, p99: 300.0 ns) | - |
+| | **SPSC Queue Transfer** | **118.89 M events/s** | **8.4 ns** | - |
+| | **.mktlog Recording** | **3.99 M events/s** | 250.6 ns | 486.64 MB/s (128.00 B/ev) |
+| | **.mktlog Replay &rarr; SPSC** | **16.57 M events/s** | 60.3 ns | - |
+| **1,000,000** | **Decode & Normalization** | **13.75 M packets/s** | **72.7 ns** | - |
+| | **SPSC Queue Transfer** | **55.14 M events/s** | **18.1 ns** | - |
+| | **.mktlog Recording** | **2.57 M events/s** | 389.1 ns | 313.93 MB/s (128.00 B/ev) |
+| | **.mktlog Replay &rarr; SPSC** | **18.78 M events/s** | 53.2 ns | - |
+
+---
+
+### 11.7 Security & Credential Isolation
+
+- **Zero Credentials Committed**: Developer API keys, client codes, passwords, and TOTP secrets are read strictly from environment variables (`ANGEL_API_KEY`, `ANGEL_CLIENT_CODE`, `ANGEL_FEED_TOKEN`, `ANGEL_PASSWORD`, `ANGEL_TOTP`).
+- **Offline Mocking**: The complete pipeline can be exercised deterministically without network access using `MockAngelFeed` and `--mock`.

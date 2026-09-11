@@ -36,7 +36,9 @@ Release/
 
 # Binary logs and runtime artifacts
 *.hftlog
+*.mktlog
 *.log
+.env*
 
 # OS generated files
 .DS_Store
