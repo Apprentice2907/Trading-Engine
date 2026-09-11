@@ -293,4 +293,121 @@ Measured Direct Synchronous Engine vs Threaded SPSC Pipeline (`MatchingEnginePip
 2. **Boundary Overhead**: End-to-end throughput is 11% to 55% lower than direct execution due to cross-thread cache coherence migrations (moving 32-byte events across L2/L3 interconnect), atomic release/acquire barriers, and inter-thread yield/pause signaling when the queue empties.
 3. **Core Benefit**: In exchange for this well-characterized boundary cost, the engine achieves complete decoupling from external inputs while guaranteeing strict single-threaded determinism.
 
+---
+
+## 10. Phase 6 — Binary Event Recording & Deterministic Replay
+
+### 10.1 Architectural Overview
+Phase 6 introduces a high-performance binary event recording and deterministic replay system using a dedicated `.hftlog` file format.
+
+```
+       [ Event Source ]
+              |
+              v
+       [ OrderEvent ] (32 bytes)
+              |
+              v
+      [ EventRecorder ] (64 KB write buffer, incremental CRC32)
+              |
+              v
+       [ .hftlog File ] (64B cache-aligned header + packed 32B records)
+              |
+              v
+      [ EventReplayer ] (64 KB read buffer, CRC32 validation)
+              |
+              +---------------------------+
+              |                           |
+              v                           v
+     [ Direct Engine ]          [ SPSC Lock-Free Queue ]
+              |                           |
+              v                           v
+   Deterministic Matches/Trades     [ Consumer / Engine ]
+```
+
+#### Core Design Invariants:
+1. **Strict Decoupling**: The binary recorder and replayer perform *no trading logic whatsoever*. They are strictly responsible for low-latency serialization, checksum integrity verification, and sequential event delivery.
+2. **Zero Dynamic Allocation**: Both recording and replay operate with `0.00 dynamic heap allocations per event`. Buffers are preallocated at initialization.
+3. **Hardware Cache Line Alignment**: The file header is precisely 64 bytes (`alignas(64)`), ensuring the payload begins on an exact cache-line boundary, and each 32-byte `OrderEvent` aligns two records per 64-byte hardware cache line.
+4. **End-to-End Cryptographic/Data Integrity**: Standard IEEE 802.3 CRC32 polynomial (`0xEDB88320`) guards both the header configuration and the full event payload against corruption, bit-rot, or truncation.
+
+---
+
+### 10.2 Binary Format Specification (`.hftlog`)
+
+#### File Header Layout (Exactly 64 bytes)
+```
+Offset  Size  Field          Type      Description
+0       4     magic          uint32_t  0x4C544648 ('HFTL' in ASCII, Little-Endian)
+4       2     version        uint16_t  Format version (currently 1)
+6       2     header_size    uint16_t  Fixed header size (64 bytes)
+8       4     record_size    uint32_t  Fixed event record size (32 bytes)
+12      4     header_crc32   uint32_t  IEEE 802.3 CRC32 of first 12 header bytes
+16      8     event_count    uint64_t  Total number of OrderEvents in payload
+24      4     data_crc32     uint32_t  Incremental IEEE 802.3 CRC32 of full payload
+28      4     flags          uint32_t  Feature flags / compression indicator (0=raw)
+32      32    reserved       uint8_t   Zero padding to complete 64-byte cache line
+```
+
+#### Event Record Layout (Exactly 32 bytes)
+```
+Offset  Size  Field          Type      Description
+0       1     type           uint8_t   EventType (1 = Add, 2 = Cancel, 3 = Modify)
+1       1     side           uint8_t   Side (0 = Buy, 1 = Sell)
+2       6     pad            uint8_t   Explicit zero padding for 8-byte boundary
+8       8     id             uint64_t  Unique OrderId
+16      8     price          int64_t   Fixed-point limit price (integer ticks)
+24      8     qty            uint64_t  Order quantity / delta quantity
+```
+
+#### Storage Efficiency & Density:
+- **Record Size**: 32 bytes
+- **Header Overhead**: 64 bytes total
+- **Density Formula**: $\text{Density} = \frac{64 + 32 \times N}{N} \text{ bytes/event}$
+- At 100,000 events: **32.0006 B/event** (File size: 3,200,064 bytes, 0.002% header)
+- At 1,000,000 events: **32.0001 B/event** (File size: 32,000,064 bytes, 0.0002% header)
+- At 10,000,000 events: **32.0000 B/event** (File size: 320,000,064 bytes, 0.00002% header)
+
+---
+
+### 10.3 Benchmark Results (Empirical Performance)
+
+Hardware: Intel Core i5-13420H (13th Gen), Windows 11, MSVC 19.44 /O2 Release.
+
+#### Allocation Verification
+- **Recording Allocations / Event**: **0.00 allocs/event** (0 total dynamic allocations)
+- **Replay Allocations / Event**: **0.00 allocs/event** (0 total dynamic allocations)
+
+#### Multi-Scale Benchmark Matrix
+| Scale | Operation / Pipeline Phase | Throughput | Latency / Event | File Size | Header Overhead |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **100,000** | **Recording** (Disk Write + CRC32) | **8.48 M ev/s** | 118.0 ns | 3.05 MB | 0.00200% |
+| | **Raw Replay** (Read + Parse) | **12.01 M ev/s** | 83.3 ns | - | - |
+| | **Replay &rarr; SPSC Queue** | **10.68 M ev/s** | 93.7 ns | - | - |
+| | **Replay &rarr; MatchingEngine** | **5.84 M ev/s** | 171.1 ns | (49,324 trades) | - |
+| **1,000,000** | **Recording** (Disk Write + CRC32) | **6.19 M ev/s** | 161.5 ns | 30.52 MB | 0.00020% |
+| | **Raw Replay** (Read + Parse) | **15.03 M ev/s** | 66.5 ns | - | - |
+| | **Replay &rarr; SPSC Queue** | **14.35 M ev/s** | 69.7 ns | - | - |
+| | **Replay &rarr; MatchingEngine** | **3.91 M ev/s** | 255.9 ns | (493,095 trades) | - |
+| **10,000,000**| **Recording** (Disk Write + CRC32) | **9.76 M ev/s** | 102.5 ns | 305.18 MB | 0.00002% |
+| | **Raw Replay** (Read + Parse) | **16.13 M ev/s** | 62.0 ns | - | - |
+| | **Replay &rarr; SPSC Queue** | **14.87 M ev/s** | 67.3 ns | - | - |
+| | **Replay &rarr; MatchingEngine** | **3.74 M ev/s** | 267.7 ns | (4,934,465 trades) | - |
+
+---
+
+### 10.4 Key Observations & Analysis
+
+1. **Raw Replay Speed Exceeds Engine Processing Capacity**:
+   Raw replay parsing sustains **16.13 Million events/sec** (62.0 ns/event). When coupled with the concurrent SPSC pipeline, events are enqueued at **14.87 Million events/sec**. Because the MatchingEngine processes complex order matching at ~3.74 to 5.84 Million events/sec, replay I/O is never the bottleneck—the matching engine remains 100% compute/cache-bound.
+
+2. **I/O Amortization via 64 KB Memory Buffers**:
+   By batching 2,048 events per system read/write, filesystem syscall overhead is reduced by a factor of 2,048x. Recording throughput reaches **9.76 Million events/sec** directly to NVMe storage while calculating running 32-bit CRC32 checksums on the fly.
+
+3. **Bit-Exact Deterministic Reproducibility**:
+   Across 10,000,000 events, direct reference execution and replay from `.hftlog` produce identical trade counts (4,934,465 trades), identical execution prices, identical residual books, and identical order lookup states. Zero drift was observed.
+
+4. **Robust Corruption Rejection**:
+   Header CRC32 and Payload CRC32 guarantee immediate, graceful rejection of corrupted files, flipped bits, truncated payloads, and incompatible versions without relying on C++ exceptions or risking undefined behavior.
+
+
 

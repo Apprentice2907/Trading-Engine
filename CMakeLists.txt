@@ -26,6 +26,8 @@ add_library(hft_core STATIC
     src/flat_order_book.cpp
     src/flat_matching_engine.cpp
     src/event_pipeline.cpp
+    src/event_recorder.cpp
+    src/event_replayer.cpp
     src/baseline/baseline_order_book.cpp
     src/baseline/baseline_matching_engine.cpp
 )
@@ -41,6 +43,12 @@ add_executable(hft_sim
 )
 target_link_libraries(hft_sim PRIVATE hft_core)
 
+# Binary log tool executable
+add_executable(hft_log_tool
+    examples/hft_log_tool.cpp
+)
+target_link_libraries(hft_log_tool PRIVATE hft_core)
+
 # Automated test suite executable
 add_executable(hft_tests
     tests/main.cpp
@@ -53,6 +61,7 @@ add_executable(hft_tests
     tests/test_differential_flat.cpp
     tests/test_spsc_queue.cpp
     tests/test_pipeline_equivalence.cpp
+    tests/test_binary_log.cpp
 )
 target_link_libraries(hft_tests PRIVATE hft_core)
 target_include_directories(hft_tests PRIVATE tests)
@@ -81,6 +90,12 @@ add_executable(pipeline_benchmark
     benchmarks/pipeline_benchmark.cpp
 )
 target_link_libraries(pipeline_benchmark PRIVATE hft_core)
+
+# Binary replay benchmark executable
+add_executable(replay_benchmark
+    benchmarks/replay_benchmark.cpp
+)
+target_link_libraries(replay_benchmark PRIVATE hft_core)
 
 
 # Enable CTest integration
