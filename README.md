@@ -1,58 +1,93 @@
-# Low-Latency C++ Exchange & Trading Engine
+# Low-Latency C++ Trading Engine
 
-An experimental low-latency C++ exchange and trading engine focused on order-book design, deterministic matching, and performance engineering.
-
-> **Note**: This is a learning and portfolio systems project inspired by electronic exchange architectures (e.g. CME, NASDAQ, LSE). It is **not** an institutional HFT system, does not claim unmeasured "nanosecond" performance, and is not production trading infrastructure. Future optimizations will strictly follow a **Correctness &rarr; Baseline &rarr; Measurement &rarr; Optimization** workflow.
+A C++20 low-latency limit order book and matching engine exploring data structures, memory allocation, lock-free event pipelines, binary event recording, and deterministic replay.
 
 ---
 
-## Current Status: Phase 0 & Phase 1 Complete
+## Current Architecture
 
-- **Phase 0 (Foundation)**: Clean C++20 project structure, CMake build setup, strong compiler warnings, and git repository integration.
-- **Phase 1 (Baseline Matching Engine)**: Single-threaded limit order book supporting standard price-time priority (FIFO), limit orders, cancellations, priority-preserving/losing modifications, and full/partial fills with bit-exact deterministic replay.
+### Real-Time Event Pipeline
+```
+Event Source
+    ↓
+OrderEvent (32B)
+    ↓
+SPSC Queue (Lock-Free)
+    ↓
+Matching Engine (Single-Threaded)
+    ↓
+Trade Events
+```
+
+### Event Logging & Deterministic Replay
+```
+Event Source
+    ↓
+Binary Recorder
+    ↓
+.hftlog (CRC32, 64B Header)
+    ↓
+Replayer
+    ↓
+Matching Engine
+```
 
 ---
 
-## Key Architectural Decisions
+## Features
 
-1. **Fixed-Point Integer Prices**:
-   Floating-point types (`float`, `double`) are avoided entirely in the matching core. Exact discrete tick pricing (`Price = int64_t`) eliminates IEEE-754 rounding inaccuracies, equality ambiguities, and cross-platform non-determinism.
-2. **Price-Time Priority (FIFO)**:
-   Resting orders at the same price level are executed in strict arrival sequence. Aggressor trades execute at the price of the resting passive order.
-3. **Explicit Invariant Verification**:
-   The engine enforces 10 formal order book invariants (e.g. uncrossed book, strict FIFO preservation, order quantity conservation, and 1-to-1 lookup table synchronization).
-4. **Baseline Control Data Structures**:
-   The initial implementation intentionally uses standard C++ containers (`std::map`, `std::list`, `std::unordered_map`) to establish a verified correct control baseline against which future low-latency container designs (e.g., flat contiguous arrays, ring buffers, intrusive lists, cache-conscious pools) will be benchmarked.
+- **Price-Time Priority**: Deterministic FIFO execution with discrete tick pricing (`int64_t`).
+- **Core Order Operations**: Full support for `LIMIT`, `CANCEL`, and `MODIFY` order types.
+- **Execution Engine**: Partial fills, multi-level sweeps, and passive resting price execution.
+- **Preallocated OrderPool**: Contiguous pool allocator eliminating per-order dynamic heap allocations.
+- **Intrusive FIFO Queues**: Index-based intrusive order chaining per price level.
+- **Price-Level Implementations**:
+  - `MapOrderBook`: Balanced tree (`std::map`) reference implementation.
+  - `FlatOrderBook`: Contiguous sorted array with binary search for cache-friendly access.
+- **Bounded SPSC Lock-Free Queue**: Fixed-capacity ring buffer with C++20 acquire-release memory ordering, index caching, and cache-line separation (`alignas(64)`).
+- **Binary Event Recording**: Compact `.hftlog` binary logging with 64-byte cache-aligned file header.
+- **Deterministic Replay**: Bit-exact reproducing of trade streams and order book states from disk.
+- **CRC32 Integrity Validation**: Compile-time `constexpr` IEEE 802.3 checksums guarding file headers and payload data.
 
 ---
 
-## Project Structure
+## Engineering Work
+
+- **Allocation Reduction**: Replaced dynamic order allocation with a preallocated `OrderPool`, achieving 0 allocations per event during core matching and binary recording/replay.
+- **Cache Locality Investigation**: Evaluated `std::map` node allocation against contiguous `FlatOrderBook` storage, measuring throughput and tail latency across varying price spreads.
+- **SPSC Pipeline**: Built a cache-aligned lock-free queue, measuring the throughput impact of false-sharing elimination and quantifying the cross-thread pipeline boundary cost.
+- **Binary Replay**: Designed a compact 32-byte event record format with buffered I/O, achieving multi-million event/second recording and replay rates.
+- **Differential Testing**: Maintained the baseline reference implementation to run continuous differential tests against optimized variants.
+- **Deterministic Benchmarks**: Validated reproducibility across identical random seeds and fixed-size microbenchmarks.
+
+---
+
+## Verification
 
 ```
-.
-├── CMakeLists.txt              # Top-level build configuration (C++20, MSVC / GCC / Clang)
-├── README.md                   # Project overview & architectural baseline
-├── .gitignore                  # Git ignore rules for build & IDE artifacts
-├── docs/
-│   └── design.md               # Detailed market microstructure & design specification
-├── include/
-│   └── hft/
-│       ├── types.hpp           # Fixed-point Price, Quantity, OrderId, strongly-typed enums
-│       ├── order.hpp           # Order struct, Trade execution event struct
-│       ├── order_book.hpp      # LimitOrderBook interface & invariant verification
-│       └── matching_engine.hpp # MatchingEngine processing submit, cancel, modify
-├── src/
-│   ├── order_book.cpp          # LOB execution, level pruning, matching logic
-│   └── matching_engine.cpp     # MatchingEngine sequence tracking & trade dispatch
-├── tests/
-│   ├── test_framework.hpp      # Lightweight, zero-dependency C++20 test runner
-│   ├── main.cpp                # Test runner entry point
-│   ├── test_order_book.cpp     # Order book unit tests (add, cancel, modify, invariants)
-│   ├── test_matching_engine.cpp# Matching engine execution & fill tests
-│   └── test_determinism.cpp    # Deterministic replay with identical event sequences
-└── examples/
-    └── basic_simulation.cpp    # CLI demonstration of order book depth & trades
+46 / 46 tests passing
 ```
+
+The test suite covers order book invariants, matching logic, intrusive pool recycling, differential equivalence (baseline vs. optimized, map vs. flat), concurrent SPSC queue stress testing, pipeline determinism, binary format corruption rejection, and end-to-end replay fidelity.
+
+---
+
+## Representative Performance
+
+> **Note**: The following measurements were collected on a single development machine (13th Gen Intel Core i5-13420H, Windows 11, MSVC 19.44 `/O2` Release). They reflect local empirical observations for comparing algorithmic and architectural trade-offs, not universal hardware-independent guarantees.
+
+| Category | Component / Workload | Throughput | Avg Latency | Dynamic Allocs |
+| :--- | :--- | :--- | :--- | :--- |
+| **Matching Engine** | Core Matching (Mixed Workload) | ~7.23 M events/sec | ~138 ns / event | 0 allocs/event* |
+| **Price Levels** | FlatOrderBook (Dense Spread, 100K) | ~11.83 M events/sec | ~84 ns / event | 0 allocs/event* |
+| **SPSC Queue** | Concurrent 1P / 1C (Capacity 16K) | ~48.02 M events/sec | ~20.8 ns / event | 0 allocs/event |
+| **Binary Logging** | Disk Recording (Buffered + CRC32, 10M) | ~9.76 M events/sec | ~102.5 ns / event | 0 allocs/event |
+| **Binary Replay** | Raw Event Parsing (10M Events) | ~16.13 M events/sec | ~62.0 ns / event | 0 allocs/event |
+| **Full Replay** | Replay $\to$ Matching Engine (10M) | ~3.74 M events/sec | ~267.7 ns / event | 0 allocs/event* |
+
+*\* Excluding unordered_map node allocations for order ID lookup where applicable.*
+
+For detailed technical analysis, memory profiles, cache-locality measurements, and architectural history, see [`docs/design.md`](docs/design.md).
 
 ---
 
@@ -61,40 +96,30 @@ An experimental low-latency C++ exchange and trading engine focused on order-boo
 ### Prerequisites
 - C++20 compliant compiler (MSVC 19.30+, GCC 11+, or Clang 13+)
 - CMake 3.20+
-- (Optional) Ninja
 
-### Build Instructions
-
+### Build
 ```bash
-# Configure the project
-cmake -S . -B build
+# Configure
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
-# Build in Release configuration
+# Build all targets
 cmake --build build --config Release
 ```
 
-### Run Automated Tests
-
+### Run Tests
 ```bash
-# Run the test executable directly
+# Run the automated test suite
 ./build/Release/hft_tests
-
-# Or via CTest
-ctest --test-dir build -C Release --output-on-failure
 ```
 
-### Run the Simulation CLI
-
+### Run Log Tool
 ```bash
-./build/Release/hft_sim
+# Record synthetic events to binary log
+./build/Release/hft_log_tool record events.hftlog 100000
+
+# Verify file integrity and CRC32 checksums
+./build/Release/hft_log_tool verify events.hftlog
+
+# Replay events through the matching engine
+./build/Release/hft_log_tool replay events.hftlog
 ```
-
----
-
-## Roadmap
-
-- **Phase 0 & 1** (Complete): Foundation, baseline limit order book, deterministic matching engine, and test harness.
-- **Phase 2**: Microbenchmarking harness, latency measurement (TSC / `std::chrono`), memory allocation profiling, and cache-locality analysis.
-- **Phase 3**: Custom low-latency data structures (intrusive double-linked lists, flat ring-buffers, memory pools).
-- **Phase 4**: Market event journal, zero-allocation deterministic replay engine.
-- **Phase 5**: Real-world external market data adapter & gateway integration.

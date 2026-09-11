@@ -32,6 +32,15 @@ Release/
 .vscode/
 *.swp
 *~
+.cache/
+
+# Binary logs and runtime artifacts
+*.hftlog
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
 
 # Scratch & temporary profiling output
 scratch/

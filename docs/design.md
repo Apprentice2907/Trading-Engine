@@ -83,21 +83,37 @@ The method `OrderBook::verify_invariants(std::string* error_out)` enforces 10 st
 
 ---
 
-## 6. Why a Baseline First?
+## 6. Phase 2 — Baseline Performance & Profiling
 
-Premature optimization obscures invariants, complicates debugging, and introduces speculative complexity without hard numbers. By first implementing a simple, correct, and extensively tested baseline:
-1. We establish a verified **golden model** for correctness testing.
-2. We can profile and measure where time is actually spent (e.g., node allocations, cache misses, branch mispredictions).
-3. Any subsequent low-latency data structure (custom memory pools, intrusive lists, flat ring-buffers) can be benchmarked against this exact control implementation.
+Phase 2 established an empirical baseline before attempting any premature optimization. For full profiling data, methodology, and latency distributions, see [`docs/baseline-performance.md`](baseline-performance.md).
+
+### 6.1 Baseline Allocation Profile
+Under high-frequency churn, standard library containers exhibited heavy dynamic heap allocation:
+- **`ADD-HEAVY`**: 2.08 – 2.40 allocations / op (159.2 bytes / op).
+- **`MATCH-HEAVY`**: 1.62 – 1.64 allocations / op and 1.48 deallocations / op.
+- **`CANCEL-HEAVY`**: 1.94 – 1.98 allocations / op and 1.93 deallocations / op.
+- **`MIXED`**: 1.22 – 1.29 allocations / op and 1.09 deallocations / op.
+
+### 6.2 Identified Bottlenecks
+1. **`std::list<Order>`**: Node allocations (`_List_node`) on every order insertion and deallocations on every fill/cancel.
+2. **`std::unordered_map` Rehashing**: Dynamic bucket array doubling caused massive **43 ms** latency spikes at 1M scale.
+3. **`std::map` Tree Nodes**: Dynamic node allocations for every price level created.
 
 ---
 
-## 7. Roadmap for Phase 2 & Beyond
+## 7. Phase 3 — Hot-Path Memory & Allocation Optimization
 
-1. **Benchmarking Harness**: Measure microsecond/nanosecond distributions (p50, p99, p99.9) using high-resolution clocks.
-2. **Allocation Profiling**: Count dynamic heap allocations (`new` / `delete`) during high-frequency order churn.
-3. **Cache-Locality Analysis**: Evaluate data cache hit rates with flat contiguously allocated price level structures.
-4. **Intrusive Containers**: Replace `std::list` with intrusive double-linked lists to eliminate node allocations.
+Phase 3 targeted dynamic memory allocation on the hot path without altering price-level data structures. For full comparative data and differential tests, see [`docs/phase3-memory-optimization.md`](phase3-memory-optimization.md).
+
+### 7.1 Architecture Changes
+1. **Contiguous OrderPool**: Created preallocated contiguous order storage (`OrderPool`), eliminating per-order heap allocations in favor of an $O(1)$ free-list index allocator.
+2. **Intrusive FIFO Lists**: Replaced `std::list<Order>` with intrusive double-linked indices (`OrderIndex prev`, `next`) embedded directly inside `PoolOrderNode`.
+3. **Rehash Control**: Added `reserve()` to pre-size `std::unordered_map` bucket arrays, completely eliminating periodic rehash latency spikes.
+
+### 7.2 Results
+- **Throughput**: Improved by up to **+59.7%** (e.g., ADD-heavy 10K increased from 4.79 M/s to 7.65 M/s).
+- **Tail Latency**: 1M max latency plummeted from **43.3 ms** down to **1.6 ms** (-96.3% latency reduction).
+- **Allocation Reduction**: Dynamic allocations per order insertion were halved from ~2.2 to ~1.1 allocs/op.
 
 ---
 
