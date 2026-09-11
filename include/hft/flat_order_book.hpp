@@ -3,62 +3,50 @@
 #include "hft/types.hpp"
 #include "hft/order.hpp"
 #include "hft/order_pool.hpp"
+#include "hft/order_book.hpp"
 
-#include <map>
-#include <unordered_map>
 #include <vector>
+#include <unordered_map>
 #include <optional>
 #include <string>
 
 namespace hft {
 
 /**
- * @brief Represents an aggregated price level with an intrusive FIFO queue of orders.
- */
-struct PriceLevel {
-    Price price{0};
-    Quantity total_quantity{0};
-    OrderIndex head{INVALID_INDEX};
-    OrderIndex tail{INVALID_INDEX};
-    size_t count{0};
-};
-
-/**
- * @brief Lightweight snapshot of a price level for display and inspection.
- */
-struct LevelView {
-    Price price{0};
-    Quantity total_quantity{0};
-    size_t order_count{0};
-};
-
-/**
- * @brief Memory-optimized deterministic Limit Order Book.
+ * @brief Experimental Limit Order Book using contiguous sorted vectors for price levels.
  *
- * Uses preallocated OrderPool storage to eliminate dynamic heap allocations per order,
- * while maintaining std::map price levels to isolate the memory optimization experiment.
+ * Designed to maximize cache locality and hardware prefetching during order matching
+ * and depth sweeps, while eliminating Red-Black tree node allocations.
+ *
+ * Best bid and best ask are available at index 0 (O(1)).
+ * Price lookups use binary search (std::lower_bound) on contiguous cache lines.
  */
-class OrderBook {
+class FlatOrderBook {
 public:
-    explicit OrderBook(size_t initial_capacity = 65536)
-        : order_pool_(initial_capacity) {
-        order_lookup_.reserve(initial_capacity);
+    explicit FlatOrderBook(size_t initial_order_capacity = 65536,
+                           size_t initial_level_capacity = 1024)
+        : order_pool_(initial_order_capacity) {
+        order_lookup_.reserve(initial_order_capacity);
+        bids_.reserve(initial_level_capacity);
+        asks_.reserve(initial_level_capacity);
     }
 
-    ~OrderBook() = default;
+    ~FlatOrderBook() = default;
 
     // Non-copyable, movable
-    OrderBook(const OrderBook&) = delete;
-    OrderBook& operator=(const OrderBook&) = delete;
-    OrderBook(OrderBook&&) noexcept = default;
-    OrderBook& operator=(OrderBook&&) noexcept = default;
+    FlatOrderBook(const FlatOrderBook&) = delete;
+    FlatOrderBook& operator=(const FlatOrderBook&) = delete;
+    FlatOrderBook(FlatOrderBook&&) noexcept = default;
+    FlatOrderBook& operator=(FlatOrderBook&&) noexcept = default;
 
     /**
-     * @brief Pre-reserves capacity for orders and hash lookup table to eliminate rehashing.
+     * @brief Pre-reserves capacity for orders, hash lookup table, and price levels.
      */
-    void reserve(size_t order_capacity) {
+    void reserve(size_t order_capacity, size_t level_capacity = 1024) {
         order_pool_.reserve(order_capacity);
         order_lookup_.reserve(order_capacity);
+        bids_.reserve(level_capacity);
+        asks_.reserve(level_capacity);
     }
 
     OrderResult add_resting_order(const Order& order);
@@ -100,11 +88,20 @@ private:
     void detach_order_from_level(PriceLevel& level, OrderIndex idx) noexcept;
     void append_order_to_level(PriceLevel& level, OrderIndex idx) noexcept;
 
-    // Bids sorted descending
-    std::map<Price, PriceLevel, std::greater<Price>> bids_;
+    // Fast contiguous binary search helpers
+    static bool bid_descending_cmp(const PriceLevel& level, Price price) noexcept {
+        return level.price > price;
+    }
+    static bool ask_ascending_cmp(const PriceLevel& level, Price price) noexcept {
+        return level.price < price;
+    }
 
-    // Asks sorted ascending
-    std::map<Price, PriceLevel, std::less<Price>> asks_;
+    // Contiguous sorted price levels
+    // Bids sorted strictly descending (best bid at index 0)
+    std::vector<PriceLevel> bids_;
+
+    // Asks sorted strictly ascending (best ask at index 0)
+    std::vector<PriceLevel> asks_;
 
     // Fast O(1) order lookup by OrderId
     std::unordered_map<OrderId, OrderLocation> order_lookup_;
@@ -112,8 +109,5 @@ private:
     // Preallocated contiguous order storage
     OrderPool order_pool_;
 };
-
-/// MapOrderBook is the reference std::map-based OrderBook implementation
-using MapOrderBook = OrderBook;
 
 } // namespace hft

@@ -1,4 +1,5 @@
 #include "hft/matching_engine.hpp"
+#include "hft/flat_matching_engine.hpp"
 #include "hft/baseline/baseline_matching_engine.hpp"
 
 #include <iostream>
@@ -278,7 +279,7 @@ public:
         AllocStats alloc_res;
         {
             EngineT engine;
-            if constexpr (std::is_same_v<EngineT, hft::MatchingEngine>) {
+            if constexpr (std::is_same_v<EngineT, hft::MatchingEngine> || std::is_same_v<EngineT, hft::FlatMatchingEngine>) {
                 if (pre_reserve) {
                     engine.reserve(count);
                 }
@@ -319,7 +320,7 @@ public:
         const int iterations = (count >= 10000000) ? 1 : 3;
         for (int iter = 0; iter < iterations; ++iter) {
             EngineT engine;
-            if constexpr (std::is_same_v<EngineT, hft::MatchingEngine>) {
+            if constexpr (std::is_same_v<EngineT, hft::MatchingEngine> || std::is_same_v<EngineT, hft::FlatMatchingEngine>) {
                 if (pre_reserve) {
                     engine.reserve(count);
                 }
@@ -359,7 +360,7 @@ public:
 
         {
             EngineT engine;
-            if constexpr (std::is_same_v<EngineT, hft::MatchingEngine>) {
+            if constexpr (std::is_same_v<EngineT, hft::MatchingEngine> || std::is_same_v<EngineT, hft::FlatMatchingEngine>) {
                 if (pre_reserve) {
                     engine.reserve(count);
                 }
@@ -419,18 +420,19 @@ public:
     }
 };
 
-void print_comparison_row(const BenchmarkResult& base, const BenchmarkResult& opt) {
-    const double tput_gain = ((opt.throughput_mops - base.throughput_mops) / base.throughput_mops) * 100.0;
+void print_comparison_row(const BenchmarkResult& map_res, const BenchmarkResult& flat_res) {
+    const double tput_gain = ((flat_res.throughput_mops - map_res.throughput_mops) / map_res.throughput_mops) * 100.0;
 
     std::cout << std::left
-              << std::setw(14) << base.workload_name
-              << std::setw(9)  << base.operation_count
-              << std::setw(11) << (std::to_string(base.p50_ns) + " / " + std::to_string(opt.p50_ns))
-              << std::setw(11) << (std::to_string(base.p99_ns) + " / " + std::to_string(opt.p99_ns))
-              << std::setw(12) << (std::to_string(base.p999_ns) + " / " + std::to_string(opt.p999_ns))
-              << std::setw(20) << (std::to_string(base.max_ns / 1000) + "us / " + std::to_string(opt.max_ns / 1000) + "us")
-              << std::setw(18) << (std::to_string(base.allocs_per_op).substr(0, 4) + " -> " + std::to_string(opt.allocs_per_op).substr(0, 4))
-              << std::fixed << std::setprecision(2) << base.throughput_mops << " -> " << opt.throughput_mops
+              << std::setw(14) << map_res.workload_name
+              << std::setw(9)  << map_res.operation_count
+              << std::setw(12) << (std::to_string(map_res.p50_ns) + " / " + std::to_string(flat_res.p50_ns))
+              << std::setw(12) << (std::to_string(map_res.p95_ns) + " / " + std::to_string(flat_res.p95_ns))
+              << std::setw(12) << (std::to_string(map_res.p99_ns) + " / " + std::to_string(flat_res.p99_ns))
+              << std::setw(13) << (std::to_string(map_res.p999_ns) + " / " + std::to_string(flat_res.p999_ns))
+              << std::setw(20) << (std::to_string(map_res.max_ns / 1000) + "us / " + std::to_string(flat_res.max_ns / 1000) + "us")
+              << std::setw(18) << (std::to_string(map_res.allocs_per_op).substr(0, 4) + " -> " + std::to_string(flat_res.allocs_per_op).substr(0, 4))
+              << std::fixed << std::setprecision(2) << map_res.throughput_mops << " -> " << flat_res.throughput_mops
               << " (" << (tput_gain >= 0.0 ? "+" : "") << std::setprecision(1) << tput_gain << "%)\n";
 }
 
@@ -440,10 +442,10 @@ int main(int argc, char* argv[]) {
 
     const double timer_overhead = BenchmarkRunner::measure_timer_overhead_ns();
 
-    std::cout << "=======================================================================================================\n";
-    std::cout << " LOW-LATENCY C++ EXCHANGE ENGINE: PHASE 3 MEMORY OPTIMIZATION BENCHMARK\n";
-    std::cout << " Comparing: Baseline (std::list) vs Optimized (OrderPool + Rehash Control)\n";
-    std::cout << "=======================================================================================================\n\n";
+    std::cout << "=======================================================================================================================\n";
+    std::cout << " LOW-LATENCY C++ EXCHANGE ENGINE: PHASE 4 PRICE-LEVEL BENCHMARK\n";
+    std::cout << " Comparing: MapMatchingEngine (std::map) vs FlatMatchingEngine (Contiguous Sorted Vector)\n";
+    std::cout << "=======================================================================================================================\n\n";
 
     std::cout << "Environment:\n";
     std::cout << "  Platform         : Windows x64\n";
@@ -468,42 +470,42 @@ int main(int argc, char* argv[]) {
         // ADD-HEAVY
         generator.reset(seed + 1);
         auto add_ops = generator.generate_add_heavy(count);
-        auto b_add = BenchmarkRunner::run<hft::baseline::MatchingEngine>("Baseline", "ADD-HEAVY", add_ops, false);
-        auto o_add = BenchmarkRunner::run<hft::MatchingEngine>("Optimized", "ADD-HEAVY", add_ops, true);
-        comparisons.push_back({b_add, o_add});
-        std::cout << "  [ADD-HEAVY]   Baseline: " << std::fixed << std::setprecision(2) << b_add.throughput_mops
-                  << " M/s (" << b_add.allocs_per_op << " allocs/op)  -->  Optimized: "
-                  << o_add.throughput_mops << " M/s (" << o_add.allocs_per_op << " allocs/op)\n";
+        auto m_add = BenchmarkRunner::run<hft::MatchingEngine>("Map", "ADD-HEAVY", add_ops, true);
+        auto f_add = BenchmarkRunner::run<hft::FlatMatchingEngine>("Flat", "ADD-HEAVY", add_ops, true);
+        comparisons.push_back({m_add, f_add});
+        std::cout << "  [ADD-HEAVY]   Map: " << std::fixed << std::setprecision(2) << m_add.throughput_mops
+                  << " M/s (" << m_add.allocs_per_op << " allocs/op)  -->  Flat: "
+                  << f_add.throughput_mops << " M/s (" << f_add.allocs_per_op << " allocs/op)\n";
 
         // MATCH-HEAVY
         generator.reset(seed + 2);
         auto match_ops = generator.generate_match_heavy(count);
-        auto b_match = BenchmarkRunner::run<hft::baseline::MatchingEngine>("Baseline", "MATCH-HEAVY", match_ops, false);
-        auto o_match = BenchmarkRunner::run<hft::MatchingEngine>("Optimized", "MATCH-HEAVY", match_ops, true);
-        comparisons.push_back({b_match, o_match});
-        std::cout << "  [MATCH-HEAVY] Baseline: " << std::fixed << std::setprecision(2) << b_match.throughput_mops
-                  << " M/s (" << b_match.allocs_per_op << " allocs/op)  -->  Optimized: "
-                  << o_match.throughput_mops << " M/s (" << o_match.allocs_per_op << " allocs/op)\n";
+        auto m_match = BenchmarkRunner::run<hft::MatchingEngine>("Map", "MATCH-HEAVY", match_ops, true);
+        auto f_match = BenchmarkRunner::run<hft::FlatMatchingEngine>("Flat", "MATCH-HEAVY", match_ops, true);
+        comparisons.push_back({m_match, f_match});
+        std::cout << "  [MATCH-HEAVY] Map: " << std::fixed << std::setprecision(2) << m_match.throughput_mops
+                  << " M/s (" << m_match.allocs_per_op << " allocs/op)  -->  Flat: "
+                  << f_match.throughput_mops << " M/s (" << f_match.allocs_per_op << " allocs/op)\n";
 
         // CANCEL-HEAVY
         generator.reset(seed + 3);
         auto cancel_ops = generator.generate_cancel_heavy(count);
-        auto b_cancel = BenchmarkRunner::run<hft::baseline::MatchingEngine>("Baseline", "CANCEL-HEAVY", cancel_ops, false);
-        auto o_cancel = BenchmarkRunner::run<hft::MatchingEngine>("Optimized", "CANCEL-HEAVY", cancel_ops, true);
-        comparisons.push_back({b_cancel, o_cancel});
-        std::cout << "  [CANCEL-HEAVY]Baseline: " << std::fixed << std::setprecision(2) << b_cancel.throughput_mops
-                  << " M/s (" << b_cancel.allocs_per_op << " allocs/op)  -->  Optimized: "
-                  << o_cancel.throughput_mops << " M/s (" << o_cancel.allocs_per_op << " allocs/op)\n";
+        auto m_cancel = BenchmarkRunner::run<hft::MatchingEngine>("Map", "CANCEL-HEAVY", cancel_ops, true);
+        auto f_cancel = BenchmarkRunner::run<hft::FlatMatchingEngine>("Flat", "CANCEL-HEAVY", cancel_ops, true);
+        comparisons.push_back({m_cancel, f_cancel});
+        std::cout << "  [CANCEL-HEAVY]Map: " << std::fixed << std::setprecision(2) << m_cancel.throughput_mops
+                  << " M/s (" << m_cancel.allocs_per_op << " allocs/op)  -->  Flat: "
+                  << f_cancel.throughput_mops << " M/s (" << f_cancel.allocs_per_op << " allocs/op)\n";
 
         // MIXED
         generator.reset(seed + 4);
         auto mixed_ops = generator.generate_mixed(count);
-        auto b_mixed = BenchmarkRunner::run<hft::baseline::MatchingEngine>("Baseline", "MIXED", mixed_ops, false);
-        auto o_mixed = BenchmarkRunner::run<hft::MatchingEngine>("Optimized", "MIXED", mixed_ops, true);
-        comparisons.push_back({b_mixed, o_mixed});
-        std::cout << "  [MIXED]       Baseline: " << std::fixed << std::setprecision(2) << b_mixed.throughput_mops
-                  << " M/s (" << b_mixed.allocs_per_op << " allocs/op)  -->  Optimized: "
-                  << o_mixed.throughput_mops << " M/s (" << o_mixed.allocs_per_op << " allocs/op)\n\n";
+        auto m_mixed = BenchmarkRunner::run<hft::MatchingEngine>("Map", "MIXED", mixed_ops, true);
+        auto f_mixed = BenchmarkRunner::run<hft::FlatMatchingEngine>("Flat", "MIXED", mixed_ops, true);
+        comparisons.push_back({m_mixed, f_mixed});
+        std::cout << "  [MIXED]       Map: " << std::fixed << std::setprecision(2) << m_mixed.throughput_mops
+                  << " M/s (" << m_mixed.allocs_per_op << " allocs/op)  -->  Flat: "
+                  << f_mixed.throughput_mops << " M/s (" << f_mixed.allocs_per_op << " allocs/op)\n\n";
     }
 
     if (run_10m) {
@@ -511,33 +513,34 @@ int main(int argc, char* argv[]) {
         const size_t count = 10000000;
         generator.reset(seed + 10);
         auto mixed_10m = generator.generate_mixed(count);
-        auto b_10m = BenchmarkRunner::run<hft::baseline::MatchingEngine>("Baseline", "MIXED-10M", mixed_10m, false);
-        auto o_10m = BenchmarkRunner::run<hft::MatchingEngine>("Optimized", "MIXED-10M", mixed_10m, true);
-        comparisons.push_back({b_10m, o_10m});
-        std::cout << "  [MIXED-10M]   Baseline: " << std::fixed << std::setprecision(2) << b_10m.throughput_mops
-                  << " M/s (" << b_10m.allocs_per_op << " allocs/op)  -->  Optimized: "
-                  << o_10m.throughput_mops << " M/s (" << o_10m.allocs_per_op << " allocs/op)\n\n";
+        auto m_10m = BenchmarkRunner::run<hft::MatchingEngine>("Map", "MIXED-10M", mixed_10m, true);
+        auto f_10m = BenchmarkRunner::run<hft::FlatMatchingEngine>("Flat", "MIXED-10M", mixed_10m, true);
+        comparisons.push_back({m_10m, f_10m});
+        std::cout << "  [MIXED-10M]   Map: " << std::fixed << std::setprecision(2) << m_10m.throughput_mops
+                  << " M/s (" << m_10m.allocs_per_op << " allocs/op)  -->  Flat: "
+                  << f_10m.throughput_mops << " M/s (" << f_10m.allocs_per_op << " allocs/op)\n\n";
     }
 
-    std::cout << "\n===============================================================================================================================\n";
-    std::cout << " PHASE 3 COMPARISON: BASELINE (std::list) vs OPTIMIZED (OrderPool + Rehash Control)\n";
-    std::cout << " Format: [Baseline] / [Optimized]\n";
-    std::cout << "===============================================================================================================================\n";
+    std::cout << "\n====================================================================================================================================================\n";
+    std::cout << " PHASE 4 COMPARISON: MAP (std::map) vs FLAT (Contiguous Sorted Vector)\n";
+    std::cout << " Format: [Map] / [Flat]\n";
+    std::cout << "====================================================================================================================================================\n";
     std::cout << std::left
               << std::setw(14) << "Workload"
               << std::setw(9)  << "Size"
-              << std::setw(11) << "p50 (ns)"
-              << std::setw(11) << "p99 (ns)"
-              << std::setw(12) << "p99.9 (ns)"
+              << std::setw(12) << "p50 (ns)"
+              << std::setw(12) << "p95 (ns)"
+              << std::setw(12) << "p99 (ns)"
+              << std::setw(13) << "p99.9 (ns)"
               << std::setw(20) << "Max Latency"
               << std::setw(18) << "Allocs/Op"
               << "Throughput (M ops/s)\n";
-    std::cout << "-------------------------------------------------------------------------------------------------------------------------------\n";
+    std::cout << "----------------------------------------------------------------------------------------------------------------------------------------------------\n";
 
-    for (const auto& [base, opt] : comparisons) {
-        print_comparison_row(base, opt);
+    for (const auto& [map_res, flat_res] : comparisons) {
+        print_comparison_row(map_res, flat_res);
     }
-    std::cout << "===============================================================================================================================\n";
+    std::cout << "====================================================================================================================================================\n";
 
     return 0;
 }

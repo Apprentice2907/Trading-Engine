@@ -82,4 +82,7 @@ private:
     Timestamp sequence_number_{0};
 };
 
+/// MapMatchingEngine is the reference std::map-based MatchingEngine
+using MapMatchingEngine = MatchingEngine;
+
 } // namespace hft

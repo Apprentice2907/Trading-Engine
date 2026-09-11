@@ -23,6 +23,8 @@ endif()
 add_library(hft_core STATIC
     src/order_book.cpp
     src/matching_engine.cpp
+    src/flat_order_book.cpp
+    src/flat_matching_engine.cpp
     src/baseline/baseline_order_book.cpp
     src/baseline/baseline_matching_engine.cpp
 )
@@ -46,6 +48,8 @@ add_executable(hft_tests
     tests/test_determinism.cpp
     tests/test_order_pool.cpp
     tests/test_differential.cpp
+    tests/test_flat_order_book.cpp
+    tests/test_differential_flat.cpp
 )
 target_link_libraries(hft_tests PRIVATE hft_core)
 target_include_directories(hft_tests PRIVATE tests)
@@ -56,6 +60,13 @@ add_executable(hft_benchmark
     benchmarks/benchmark.cpp
 )
 target_link_libraries(hft_benchmark PRIVATE hft_core)
+
+# Price-level microbenchmark executable
+add_executable(price_level_benchmark
+    benchmarks/price_level_benchmark.cpp
+)
+target_link_libraries(price_level_benchmark PRIVATE hft_core)
+
 
 # Enable CTest integration
 enable_testing()
