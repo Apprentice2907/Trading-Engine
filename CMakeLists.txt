@@ -36,6 +36,9 @@ add_library(hft_core STATIC
     src/market_data_pipeline.cpp
     src/market_recorder.cpp
     src/market_replayer.cpp
+    src/risk/risk_engine.cpp
+    src/gateway/order_gateway.cpp
+    src/pipeline/execution_pipeline.cpp
 )
 
 if (WIN32)
@@ -79,6 +82,7 @@ add_executable(hft_tests
     tests/test_pipeline_equivalence.cpp
     tests/test_binary_log.cpp
     tests/test_angel_market_data.cpp
+    tests/test_execution_pipeline.cpp
 )
 target_link_libraries(hft_tests PRIVATE hft_core)
 target_include_directories(hft_tests PRIVATE tests)
@@ -119,6 +123,12 @@ add_executable(market_data_benchmark
     benchmarks/market_data_benchmark.cpp
 )
 target_link_libraries(market_data_benchmark PRIVATE hft_core)
+
+# Execution pipeline benchmark executable
+add_executable(execution_pipeline_benchmark
+    benchmarks/execution_pipeline_benchmark.cpp
+)
+target_link_libraries(execution_pipeline_benchmark PRIVATE hft_core)
 
 # Enable CTest integration
 enable_testing()

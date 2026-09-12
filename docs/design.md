@@ -576,3 +576,163 @@ Hardware: Intel Core i5-13420H (13th Gen, 8 cores / 12 threads), Windows 11, MSV
 
 - **Zero Credentials Committed**: Developer API keys, client codes, passwords, and TOTP secrets are read strictly from environment variables (`ANGEL_API_KEY`, `ANGEL_CLIENT_CODE`, `ANGEL_FEED_TOKEN`, `ANGEL_PASSWORD`, `ANGEL_TOTP`).
 - **Offline Mocking**: The complete pipeline can be exercised deterministically without network access using `MockAngelFeed` and `--mock`.
+
+---
+
+## 12. Phase 8 — Low-Latency Execution Pipeline & Pre-Trade Risk
+
+### 12.1 Execution Architecture & Concurrency Model
+
+Phase 8 constructs the execution side of the trading system, implementing a complete, deterministic, paper/simulated execution pipeline:
+
+```
+PRODUCER THREAD (Strategy / Ingress Source)
+  │
+  ▼  (OrderCommand - 64 bytes)
+[ SpscQueue<OrderCommand> (Lock-Free Ingress Ring Buffer) ]
+  │
+═════════════════════════════════════════════════════════════════════════════
+  │  (Thread Boundary — Zero Mutexes / Zero Kernel Locks)
+  ▼
+EXECUTION WORKER THREAD (Sole Owner of Risk, Gateway & Engine State)
+  │
+  ├─► [ 1. PreTradeRiskEngine ]
+  │      • Order sanity (price, quantity, side, instrument)
+  │      • Maximum order quantity check
+  │      • Maximum order notional check (price * quantity)
+  │      • Price protection (band checks)
+  │      • Aggregate exposure limits
+  │      └── If REJECTED ──► Emits ExecutionReport(RiskRejected) ──────┐
+  │                                                                   │
+  └─► [ 2. OrderGateway ] (If Approved)                               │
+         │                                                            │
+         ▼                                                            │
+      [ 3. MatchingEngine (Single-Threaded Deterministic Core) ]      │
+         │                                                            │
+         ▼ (Trades / OrderResult)                                     │
+      [ 4. Execution Report Generator ]                               │
+         │ (Translates matching fills, partial fills, resting)        │
+         ▼                                                            │
+══════════════════════════════════════════════════════════════════════╪══════
+  │                                                                   │
+  └─────────────────────────────────┬─────────────────────────────────┘
+                                    │
+                                    ▼  (ExecutionReport - 64 bytes)
+                  [ SpscQueue<ExecutionReport> (Egress Ring Buffer) ]
+                                    │
+                                    ▼
+CONSUMER THREAD (Position Tracker / Audit Logger / Strategy Feedback)
+```
+
+#### Why the MatchingEngine Remains Single-Threaded
+In high-frequency exchange architectures, protecting order books with mutexes or fine-grained locks causes severe cache line bouncing, context switching, and non-deterministic tail-latency spikes. 
+
+In this system:
+1. **Exclusive Ownership**: The execution worker thread is the sole mutator of `PreTradeRiskEngine`, `OrderGateway`, and `MatchingEngine`.
+2. **Lock-Free Concurrency Boundaries**: All inter-thread communication occurs over lock-free single-producer single-consumer ring buffers (`SpscQueue`).
+3. **Deterministic Sequential Processing**: Orders execute in strict FIFO queue arrival order with zero thread contention on the matching core.
+
+---
+
+### 12.2 Cache-Aligned Data Structures (64 Bytes)
+
+Both ingress requests and egress reports are sized to **exactly 64 bytes (one hardware cache line)**, eliminating false sharing, preventing misaligned cache line splits, and guaranteeing zero dynamic heap allocation:
+
+#### `OrderCommand` (Ingress Request, 64 Bytes, `alignas(64)`)
+- `OrderId order_id` (8B)
+- `uint32_t instrument_id` (4B)
+- `uint32_t client_id` (4B)
+- `EventType type` (1B: Add, Cancel, Modify)
+- `Side side` (1B: Buy, Sell)
+- `OrderType order_type` (1B: Limit)
+- `uint8_t pad[5]` (5B)
+- `Price price` (8B: discrete integer ticks/paise)
+- `Quantity qty` (8B)
+- `Timestamp timestamp` (8B: monotonic ingress time in ns)
+- `uint8_t reserved[16]` (16B)
+
+#### `ExecutionReport` (Egress Report, 64 Bytes, `alignas(64)`)
+- `OrderId order_id` (8B)
+- `uint64_t exec_id` (8B: monotonic execution sequence)
+- `Price price` (8B: execution fill price or limit price)
+- `Quantity last_qty` (8B: filled quantity in this event)
+- `Quantity leaves_qty` (8B: resting quantity remaining open)
+- `Timestamp timestamp` (8B: engine timestamp in ns)
+- `uint32_t instrument_id` (4B)
+- `uint32_t client_id` (4B)
+- `ExecutionType exec_type` (1B: New, RiskRejected, EngineRejected, Trade, Cancelled, Modified)
+- `Side side` (1B: Buy, Sell)
+- `RiskCode risk_code` (1B: risk rejection code if rejected)
+- `OrderResult engine_result` (1B: engine return code)
+- `uint8_t pad[4]` (4B)
+
+---
+
+### 12.3 Pre-Trade Risk Rules & Enforcement
+
+The `PreTradeRiskEngine` evaluates every incoming order before it reaches the order gateway:
+1. **Order Sanity**: Cancels bypass sizing (strictly reduce exposure). New/Modify orders require `order_id > 0`, `qty > 0`, `price > 0`, valid side (`Buy`/`Sell`), and valid instrument.
+2. **Maximum Order Quantity**: Rejects orders where `qty > max_order_quantity`.
+3. **Maximum Order Notional**: Rejects orders where $\text{price} \times \text{qty} > \text{max\_order\_notional}$ using fixed-point integer multiplication (0 floating-point ops).
+4. **Price Band Protection**: Rejects limit prices outside configured $[\text{min\_price}, \text{max\_price}]$ bands.
+5. **Aggregate Exposure Tracking**: Tracks cumulative open resting quantities. Rejects orders exceeding `max_exposure_quantity`. Automatically releases exposure upon trade executions and cancellations.
+6. **Zero Allocation**: Employs flat atomic and integer counters with zero heap utilization.
+
+---
+
+### 12.4 Order Lifecycle
+
+```
+       Incoming OrderCommand
+                 │
+                 ▼
+       [ Pre-Trade Risk Check ]
+        ├── Rejected ──► ExecutionReport(RiskRejected)
+        │
+        ▼ Approved
+       [ Gateway Dispatch ]
+        ├── Duplicate ID / Invalid ──► ExecutionReport(EngineRejected)
+        │
+        ▼ Matching Engine
+        ├── Crosses Book ──► ExecutionReport(Trade) [Fill / PartialFill]
+        └── Book Empty   ──► ExecutionReport(New)   [Resting in OrderBook]
+                 │
+                 ▼ (Subsequent Cancel Command)
+       [ Cancel Lifecycle ]
+        ├── Found in Book ──► ExecutionReport(Cancelled) [Leaves = 0, Releases Exposure]
+        └── Not in Book   ──► ExecutionReport(EngineRejected) [OrderNotFound]
+```
+
+---
+
+### 12.5 Empirical Benchmark Results
+
+Hardware: Intel Core i5-13420H (13th Gen, 8 cores / 12 threads), Windows 11, MSVC 19.50 /O2 Release.
+
+#### Dynamic Memory Allocation Audit
+- **Pre-Trade Risk Engine**: **0.00 allocs/check** (0 total dynamic allocations across 50,000 checks).
+- **Risk-Rejected Path**: **0.00 allocs/order** (0 total dynamic allocations through Gateway).
+- **SPSC Queue Ingress & Egress**: **0.00 allocs/op** (0 total dynamic allocations).
+- **Crossing Matches (Immediate Fills)**: **0.00 allocs/trade** (0 dynamic allocations on matched executions).
+- **Order Cancellation Hot Path**: **0.00 allocs/cancel** (0 dynamic allocations).
+- **Reference OrderBook Insertion**: 1.002 allocs/order (originating from `order_lookup_` `std::unordered_map` node allocation in the reference book).
+
+#### Multi-Scale Performance Matrix
+| Scale | Subsystem / Workload | Throughput | Avg Latency | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| **100,000** | **Pre-Trade Risk Checks Only** | **40.71 M checks/s** | **24.6 ns** | Pure arithmetic validation |
+| | **Resting Orders (Risk+Gateway+Match)**| **1.47 M orders/s** | **680.4 ns** | 100,000 reports generated |
+| | **Match-Heavy Crossing Execution** | **4.38 M orders/s** | **228.5 ns** | 50,000 trade fills executed |
+| | **Mixed Workload (60% Add, 25% Cxl, 15% Cross)**| **2.02 M ops/s** | **495.7 ns** | Realistic order flow |
+| **1,000,000** | **Pre-Trade Risk Checks Only** | **73.86 M checks/s** | **13.5 ns** | Sustained high-throughput filtering |
+| | **Resting Orders (Risk+Gateway+Match)**| **0.98 M orders/s** | **1,023.5 ns** | 1,000,000 reports generated |
+| | **Match-Heavy Crossing Execution** | **1.17 M orders/s** | **851.3 ns** | 500,000 trade fills executed |
+| | **Mixed Workload (60% Add, 25% Cxl, 15% Cross)**| **1.88 M ops/s** | **533.0 ns** | Sustained multi-operation stream |
+
+#### Stage Latency Breakdown (100,000 Samples)
+- **Mean Latency**: 1,035.1 ns (1.0 µs)
+- **p50 Latency**: 900.0 ns (0.9 µs)
+- **p95 Latency**: 1,400.0 ns (1.4 µs)
+- **p99 Latency**: 2,000.0 ns (2.0 µs)
+- **p99.9 Latency**: 28,500.0 ns (28.5 µs)
+- **Max Latency**: 398,900.0 ns (398.9 µs)
