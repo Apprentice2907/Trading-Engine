@@ -254,6 +254,7 @@ OrderResult OrderBook::modify(OrderId id, Price new_price, Quantity new_qty,
         const Quantity diff = new_qty - existing.remaining_qty;
         existing.remaining_qty = new_qty;
         existing.initial_qty += diff;
+        existing.timestamp = trade_seq;
 
         if (loc.side == Side::Buy) {
             auto& level = bids_[loc.price];
@@ -274,6 +275,7 @@ OrderResult OrderBook::modify(OrderId id, Price new_price, Quantity new_qty,
     replacement.price = new_price;
     replacement.remaining_qty = new_qty;
     replacement.initial_qty = new_qty;
+    replacement.timestamp = trade_seq;
 
     cancel(id);
     return process_order(replacement, trades, trade_seq);

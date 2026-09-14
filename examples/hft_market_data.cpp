@@ -1,11 +1,4 @@
-#include "hft/market_event.hpp"
-#include "hft/broker/angel_types.hpp"
-#include "hft/broker/angel_decoder.hpp"
-#include "hft/broker/mock_angel_feed.hpp"
-#include "hft/broker/angel_client.hpp"
-#include "hft/market_data_pipeline.hpp"
-#include "hft/market_recorder.hpp"
-#include "hft/market_replayer.hpp"
+#include "hft/market_data.hpp"
 
 #include <iostream>
 #include <iomanip>

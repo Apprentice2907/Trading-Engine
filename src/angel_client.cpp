@@ -1,5 +1,5 @@
 #define _CRT_SECURE_NO_WARNINGS
-#include "hft/broker/angel_client.hpp"
+#include "hft/market_data.hpp"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -220,7 +220,6 @@ bool AngelClient::subscribe(uint32_t token, uint8_t mode, uint8_t exchange) {
 #else
     if (!h_websocket_) return false;
 
-    // Construct Angel One SmartStream JSON subscription request
     std::string sub_req = "{\"action\": 1, \"params\": {\"mode\": " +
                           std::to_string(mode) +
                           ", \"tokenList\": [{\"exchangeType\": " +

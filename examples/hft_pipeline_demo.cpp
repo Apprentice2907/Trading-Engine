@@ -1,13 +1,6 @@
-#include "hft/order_command.hpp"
-#include "hft/execution_report.hpp"
-#include "hft/risk/risk_engine.hpp"
-#include "hft/gateway/order_gateway.hpp"
-#include "hft/pipeline/execution_pipeline.hpp"
-#include "hft/market_event.hpp"
-#include "hft/market_data_pipeline.hpp"
-#include "hft/broker/mock_angel_feed.hpp"
-#include "hft/broker/angel_decoder.hpp"
-#include "hft/broker/angel_client.hpp"
+#include "hft/order.hpp"
+#include "hft/trading_pipeline.hpp"
+#include "hft/market_data.hpp"
 
 #include <iostream>
 #include <iomanip>

@@ -2,7 +2,6 @@
 
 #include "hft/types.hpp"
 #include "hft/order.hpp"
-#include "hft/order_pool.hpp"
 #include "hft/order_book.hpp"
 
 #include <vector>
@@ -14,9 +13,6 @@ namespace hft {
 
 /**
  * @brief Experimental Limit Order Book using contiguous sorted vectors for price levels.
- *
- * Designed to maximize cache locality and hardware prefetching during order matching
- * and depth sweeps, while eliminating Red-Black tree node allocations.
  *
  * Best bid and best ask are available at index 0 (O(1)).
  * Price lookups use binary search (std::lower_bound) on contiguous cache lines.
@@ -33,15 +29,11 @@ public:
 
     ~FlatOrderBook() = default;
 
-    // Non-copyable, movable
     FlatOrderBook(const FlatOrderBook&) = delete;
     FlatOrderBook& operator=(const FlatOrderBook&) = delete;
     FlatOrderBook(FlatOrderBook&&) noexcept = default;
     FlatOrderBook& operator=(FlatOrderBook&&) noexcept = default;
 
-    /**
-     * @brief Pre-reserves capacity for orders, hash lookup table, and price levels.
-     */
     void reserve(size_t order_capacity, size_t level_capacity = 1024) {
         order_pool_.reserve(order_capacity);
         order_lookup_.reserve(order_capacity);
@@ -56,7 +48,6 @@ public:
     OrderResult modify(OrderId id, Price new_price, Quantity new_qty,
                        std::vector<Trade>& trades, uint64_t& trade_seq);
 
-    // Book state queries
     [[nodiscard]] bool has_order(OrderId id) const noexcept;
     [[nodiscard]] std::optional<Order> get_order(OrderId id) const;
 
@@ -88,7 +79,6 @@ private:
     void detach_order_from_level(PriceLevel& level, OrderIndex idx) noexcept;
     void append_order_to_level(PriceLevel& level, OrderIndex idx) noexcept;
 
-    // Fast contiguous binary search helpers
     static bool bid_descending_cmp(const PriceLevel& level, Price price) noexcept {
         return level.price > price;
     }
@@ -96,18 +86,52 @@ private:
         return level.price < price;
     }
 
-    // Contiguous sorted price levels
-    // Bids sorted strictly descending (best bid at index 0)
     std::vector<PriceLevel> bids_;
-
-    // Asks sorted strictly ascending (best ask at index 0)
     std::vector<PriceLevel> asks_;
-
-    // Fast O(1) order lookup by OrderId
     std::unordered_map<OrderId, OrderLocation> order_lookup_;
-
-    // Preallocated contiguous order storage
     OrderPool order_pool_;
+};
+
+/**
+ * @brief Matching Engine wrapping the experimental FlatOrderBook.
+ */
+class FlatMatchingEngine {
+public:
+    FlatMatchingEngine() = default;
+    ~FlatMatchingEngine() = default;
+
+    FlatMatchingEngine(const FlatMatchingEngine&) = delete;
+    FlatMatchingEngine& operator=(const FlatMatchingEngine&) = delete;
+    FlatMatchingEngine(FlatMatchingEngine&&) noexcept = default;
+    FlatMatchingEngine& operator=(FlatMatchingEngine&&) noexcept = default;
+
+    OrderResult submit_limit_order(OrderId id, Side side, Price price, Quantity qty,
+                                  std::vector<Trade>& trades);
+
+    OrderResult cancel_order(OrderId id);
+
+    OrderResult modify_order(OrderId id, Price new_price, Quantity new_qty,
+                            std::vector<Trade>& trades);
+
+    void reserve(size_t order_capacity, size_t level_capacity = 1024) {
+        book_.reserve(order_capacity, level_capacity);
+    }
+
+    [[nodiscard]] const FlatOrderBook& book() const noexcept { return book_; }
+    [[nodiscard]] FlatOrderBook& book() noexcept { return book_; }
+    [[nodiscard]] uint64_t total_trades_generated() const noexcept { return trade_sequence_; }
+    [[nodiscard]] Timestamp current_sequence() const noexcept { return sequence_number_; }
+
+    [[nodiscard]] bool verify_invariants(std::string* error_out = nullptr) const {
+        return book_.verify_invariants(error_out);
+    }
+
+    void reset();
+
+private:
+    FlatOrderBook book_;
+    uint64_t trade_sequence_{0};
+    Timestamp sequence_number_{0};
 };
 
 } // namespace hft

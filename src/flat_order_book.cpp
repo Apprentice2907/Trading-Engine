@@ -262,6 +262,7 @@ OrderResult FlatOrderBook::modify(OrderId id, Price new_price, Quantity new_qty,
         const Quantity diff = new_qty - existing.remaining_qty;
         existing.remaining_qty = new_qty;
         existing.initial_qty += diff;
+        existing.timestamp = trade_seq;
 
         if (loc.side == Side::Buy) {
             auto bid_it = std::lower_bound(bids_.begin(), bids_.end(), loc.price, bid_descending_cmp);
@@ -286,6 +287,7 @@ OrderResult FlatOrderBook::modify(OrderId id, Price new_price, Quantity new_qty,
     replacement.price = new_price;
     replacement.remaining_qty = new_qty;
     replacement.initial_qty = new_qty;
+    replacement.timestamp = trade_seq;
 
     cancel(id);
     return process_order(replacement, trades, trade_seq);
@@ -561,6 +563,61 @@ bool FlatOrderBook::verify_invariants(std::string* error_out) const {
     }
 
     return true;
+}
+
+// ============================================================================
+// FlatMatchingEngine Implementation
+// ============================================================================
+
+OrderResult FlatMatchingEngine::submit_limit_order(OrderId id, Side side, Price price, Quantity qty,
+                                                  std::vector<Trade>& trades) {
+    if (id == 0) {
+        return OrderResult::RejectedDuplicateId;
+    }
+    if (price <= 0) {
+        return OrderResult::RejectedInvalidPrice;
+    }
+    if (qty == 0) {
+        return OrderResult::RejectedInvalidQuantity;
+    }
+    if (book_.has_order(id)) {
+        return OrderResult::RejectedDuplicateId;
+    }
+
+    ++sequence_number_;
+    Order order{
+        id,
+        price,
+        qty,
+        qty,
+        side,
+        OrderType::Limit,
+        sequence_number_
+    };
+
+    return book_.process_order(order, trades, trade_sequence_);
+}
+
+OrderResult FlatMatchingEngine::cancel_order(OrderId id) {
+    if (id == 0) {
+        return OrderResult::RejectedOrderNotFound;
+    }
+    return book_.cancel(id);
+}
+
+OrderResult FlatMatchingEngine::modify_order(OrderId id, Price new_price, Quantity new_qty,
+                                            std::vector<Trade>& trades) {
+    if (id == 0) {
+        return OrderResult::RejectedOrderNotFound;
+    }
+    ++sequence_number_;
+    return book_.modify(id, new_price, new_qty, trades, sequence_number_);
+}
+
+void FlatMatchingEngine::reset() {
+    book_ = FlatOrderBook();
+    trade_sequence_ = 0;
+    sequence_number_ = 0;
 }
 
 } // namespace hft

@@ -73,6 +73,55 @@ The system strictly decouples inbound real-time market-data observation from ord
 
 ---
 
+## Repository Structure
+
+The codebase is organized into ~25 purposeful files with no fragmented abstractions or code bloat:
+
+```text
+Stocks/
+├── CMakeLists.txt              # Unified C++20 build configuration
+├── README.md                   # System design, benchmarks, and documentation
+│
+├── include/hft/
+│   ├── types.hpp               # Numerical primitives, Price/Quantity types, core domain enums
+│   ├── order.hpp               # Order, Trade, OrderCommand (64B), and ExecutionReport (64B)
+│   ├── order_book.hpp          # LimitOrderBook + embedded contiguous OrderPool
+│   ├── flat_order_book.hpp     # Cache-friendly vector LOB + FlatMatchingEngine comparison
+│   ├── matching_engine.hpp     # Deterministic single-threaded Matching Engine (MapMatchingEngine)
+│   ├── spsc_queue.hpp          # Lock-free cacheline-padded SPSC ring buffer
+│   ├── market_data.hpp         # MarketEvent (128B), CRC32, .mktlog format, Angel decoder & feed
+│   └── trading_pipeline.hpp    # PreTradeRiskEngine, OrderGateway, and OrderExecutionPipeline
+│
+├── src/
+│   ├── order_book.cpp          # Map-based LOB implementation + OrderPool recycling
+│   ├── flat_order_book.cpp     # Dense vector order book + FlatMatchingEngine
+│   ├── matching_engine.cpp     # Top-level matching engine & order routing
+│   ├── market_data.cpp         # SmartStream packet decoding, mock feed, .mktlog recorder & replayer
+│   ├── angel_client.cpp        # WinHTTP WebSocket transport for live broker data
+│   └── trading_pipeline.cpp    # Risk validation, gateway report emission, threaded execution loop
+│
+├── tests/
+│   ├── test_framework.hpp      # Zero-dependency header-only test harness
+│   ├── main.cpp                # Test runner entry point
+│   ├── test_engine.cpp         # 26 tests: OrderBook, MatchingEngine, OrderPool, FlatBook differential
+│   ├── test_market_data.cpp    # 21 tests: Wire decoders, SPSC drops, .mktlog CRC32 corruption tests
+│   └── test_pipeline.cpp       # 26 tests: 2M SPSC stress test, risk rules, gateway lifecycle, equivalence
+│
+├── examples/
+│   ├── basic_simulation.cpp    # Step-by-step console demonstration of matching and order book invariants
+│   ├── hft_market_data.cpp     # CLI tool for streaming, recording, and replaying real/mock market data
+│   └── hft_pipeline_demo.cpp   # End-to-end multi-threaded market data & order execution demonstration
+│
+└── benchmarks/
+    ├── benchmark.cpp                   # Comprehensive matching engine benchmark & alloc tracker
+    ├── price_level_benchmark.cpp       # Price-level lookup comparison (std::map vs. alternatives)
+    ├── queue_benchmark.cpp             # SPSC lock-free queue throughput vs. std::mutex queue
+    ├── market_data_benchmark.cpp       # Wire packet decoding and .mktlog serialization throughput
+    └── execution_pipeline_benchmark.cpp# End-to-end threaded pipeline throughput and latency profiling
+```
+
+---
+
 ## Core Engineering
 
 - **Zero-Allocation Hot Path**: Preallocated `OrderPool` and intrusive FIFO order chaining eliminate per-order dynamic heap allocations during core matching, risk checks, and queue transit.
@@ -177,7 +226,6 @@ cmake --build build --config Release
 ./build/Release/hft_benchmark
 ./build/Release/price_level_benchmark
 ./build/Release/queue_benchmark
-./build/Release/replay_benchmark
 ./build/Release/market_data_benchmark
 ./build/Release/execution_pipeline_benchmark
 ```

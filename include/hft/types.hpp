@@ -2,74 +2,58 @@
 
 #include <cstdint>
 #include <string_view>
-#include <string>
 #include <ostream>
-
 
 namespace hft {
 
-/**
- * @brief Fixed-point integer price representation.
- *
- * Floating-point representation (e.g. float/double) is strictly avoided in
- * the core matching engine because:
- *  1. IEEE-754 binary floating point cannot precisely represent decimal fractions
- *     (e.g., 0.1 + 0.2 != 0.3), introducing cumulative rounding errors.
- *  2. Equality comparisons between floating point values are indeterminate without
- *     an arbitrary epsilon, violating deterministic matching.
- *  3. Different compiler optimizations, architectures, or FPU registers (e.g. x87 vs SSE)
- *     can evaluate floating-point expressions differently, breaking replay determinism.
- *
- * In this engine, Price is stored as an integer multiple of the instrument's minimum
- * price variation (tick). For example, 10025 represents 100.25 when tick scale is 100.
- */
+// Core numerical types
 using Price = int64_t;
-
-/**
- * @brief Order and trade quantity representation (e.g. number of shares or lots).
- */
 using Quantity = uint64_t;
-
-/**
- * @brief Unique order identifier across the lifetime of the engine.
- */
 using OrderId = uint64_t;
-
-/**
- * @brief Unique trade execution identifier.
- */
 using TradeId = uint64_t;
-
-/**
- * @brief Monotonic sequence or timestamp in nanoseconds.
- */
 using Timestamp = uint64_t;
+using InstrumentId = uint32_t;
+using ClientId = uint32_t;
 
-/**
- * @brief Order side: Buy (bid) or Sell (ask).
- */
+// Sentinels
+inline constexpr Price INVALID_PRICE = 0;
+inline constexpr Quantity INVALID_QUANTITY = 0;
+inline constexpr OrderId INVALID_ORDER_ID = 0;
+
 enum class Side : uint8_t {
-    Buy,
-    Sell
+    Buy = 1,
+    Sell = 2
 };
 
-/**
- * @brief Supported order types for Phase 1.
- */
 enum class OrderType : uint8_t {
-    Limit
+    Limit = 1
 };
 
-/**
- * @brief Status returned by order submission, cancellation, and modification.
- */
+enum class EventType : uint8_t {
+    Add = 1,
+    Cancel = 2,
+    Modify = 3
+};
+
+enum class RiskCode : uint8_t {
+    Approved = 0,
+    InvalidSide = 1,
+    InvalidPrice = 2,
+    InvalidQuantity = 3,
+    InvalidInstrument = 4,
+    MaxQuantityExceeded = 5,
+    MaxNotionalExceeded = 6,
+    PriceBandViolation = 7,
+    ExposureLimitExceeded = 8
+};
+
 enum class OrderResult : uint8_t {
-    Accepted,
-    RejectedInvalidPrice,
-    RejectedInvalidQuantity,
-    RejectedDuplicateId,
-    RejectedOrderNotFound,
-    RejectedUnchanged
+    Accepted = 0,
+    RejectedInvalidPrice = 1,
+    RejectedInvalidQuantity = 2,
+    RejectedDuplicateId = 3,
+    RejectedOrderNotFound = 4,
+    RejectedUnchanged = 5
 };
 
 constexpr std::string_view to_string(Side side) noexcept {
@@ -87,6 +71,30 @@ constexpr std::string_view to_string(OrderType type) noexcept {
     return "UNKNOWN";
 }
 
+constexpr std::string_view to_string(EventType type) noexcept {
+    switch (type) {
+        case EventType::Add:    return "ADD";
+        case EventType::Cancel: return "CANCEL";
+        case EventType::Modify: return "MODIFY";
+    }
+    return "UNKNOWN";
+}
+
+constexpr std::string_view to_string(RiskCode code) noexcept {
+    switch (code) {
+        case RiskCode::Approved:              return "APPROVED";
+        case RiskCode::InvalidSide:           return "INVALID_SIDE";
+        case RiskCode::InvalidPrice:          return "INVALID_PRICE";
+        case RiskCode::InvalidQuantity:       return "INVALID_QUANTITY";
+        case RiskCode::InvalidInstrument:     return "INVALID_INSTRUMENT";
+        case RiskCode::MaxQuantityExceeded:   return "MAX_QUANTITY_EXCEEDED";
+        case RiskCode::MaxNotionalExceeded:   return "MAX_NOTIONAL_EXCEEDED";
+        case RiskCode::PriceBandViolation:    return "PRICE_BAND_VIOLATION";
+        case RiskCode::ExposureLimitExceeded: return "EXPOSURE_LIMIT_EXCEEDED";
+    }
+    return "UNKNOWN";
+}
+
 constexpr std::string_view to_string(OrderResult res) noexcept {
     switch (res) {
         case OrderResult::Accepted:                 return "ACCEPTED";
@@ -99,17 +107,10 @@ constexpr std::string_view to_string(OrderResult res) noexcept {
     return "UNKNOWN";
 }
 
-inline std::ostream& operator<<(std::ostream& os, Side side) {
-    return os << to_string(side);
-}
-
-inline std::ostream& operator<<(std::ostream& os, OrderType type) {
-    return os << to_string(type);
-}
-
-inline std::ostream& operator<<(std::ostream& os, OrderResult res) {
-    return os << to_string(res);
-}
+inline std::ostream& operator<<(std::ostream& os, Side side) { return os << to_string(side); }
+inline std::ostream& operator<<(std::ostream& os, OrderType type) { return os << to_string(type); }
+inline std::ostream& operator<<(std::ostream& os, EventType type) { return os << to_string(type); }
+inline std::ostream& operator<<(std::ostream& os, RiskCode code) { return os << to_string(code); }
+inline std::ostream& operator<<(std::ostream& os, OrderResult res) { return os << to_string(res); }
 
 } // namespace hft
-

@@ -1,8 +1,5 @@
-#include "hft/order_command.hpp"
-#include "hft/execution_report.hpp"
-#include "hft/risk/risk_engine.hpp"
-#include "hft/gateway/order_gateway.hpp"
-#include "hft/pipeline/execution_pipeline.hpp"
+#include "hft/order.hpp"
+#include "hft/trading_pipeline.hpp"
 #include "hft/matching_engine.hpp"
 #include "hft/spsc_queue.hpp"
 

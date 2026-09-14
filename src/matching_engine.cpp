@@ -43,7 +43,8 @@ OrderResult MatchingEngine::modify_order(OrderId id, Price new_price, Quantity n
     if (id == 0) {
         return OrderResult::RejectedOrderNotFound;
     }
-    return book_.modify(id, new_price, new_qty, trades, trade_sequence_);
+    ++sequence_number_;
+    return book_.modify(id, new_price, new_qty, trades, sequence_number_);
 }
 
 void MatchingEngine::reset() {
