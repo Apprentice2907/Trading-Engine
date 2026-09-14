@@ -736,3 +736,114 @@ Hardware: Intel Core i5-13420H (13th Gen, 8 cores / 12 threads), Windows 11, MSV
 - **p99 Latency**: 2,000.0 ns (2.0 µs)
 - **p99.9 Latency**: 28,500.0 ns (28.5 µs)
 - **Max Latency**: 398,900.0 ns (398.9 µs)
+
+---
+
+## 13. Final End-to-End System Architecture & Release Validation
+
+### 13.1 Dual-Path System Topology
+
+The engine architecture strictly segregates external market data observation from internal order matching. There is zero coupling between inbound broker market ticks and order matching logic:
+
+```
+                         LIVE MARKET DATA (READ ONLY)
+                                       │
+                                       ▼
+                                Angel One Feed
+                                       │
+                                       ▼
+                                 Feed Handler
+                                       │
+                                       ▼
+                             MarketEvent (128B)
+                                       │
+                                       ▼
+                                SPSC Lock-Free
+                                       │
+                                       ▼
+                               Market Processing
+                                       │
+                          ┌────────────┴────────────┐
+                          │                         │
+                          ▼                         ▼
+                       Recording                 Processing
+                          │
+                          ▼
+                       .mktlog
+                          │
+                          ▼
+                        Replay
+
+
+                         SIMULATED ORDER EXECUTION PATH
+                                  Order Source
+                                       │
+                                       ▼
+                              OrderCommand (64B)
+                                       │
+                                       ▼
+                                Ingress SPSC Queue
+                                       │
+                                       ▼
+                                 Pre-Trade Risk
+                                       │
+                                       ▼
+                                 Order Gateway
+                                       │
+                                       ▼
+                      MATCHING ENGINE (SIMULATED EXCHANGE)
+                                       │
+                                       ▼
+                            ExecutionReport (64B)
+                                       │
+                                       ▼
+                                Egress SPSC Queue
+                                       │
+                                       ▼
+                               Execution Consumer
+```
+
+#### Core Architectural Distinctions:
+1. **`LIVE MARKET DATA = READ ONLY`**:
+   - Angel One SmartAPI WebSocket feed is used strictly as a real-time market data source.
+   - Zero order-placement, order-modification, or order-cancellation API calls are ever made to the broker.
+   - Credentials exist strictly in process memory derived from environment variables (`ANGEL_API_KEY`, `ANGEL_CLIENT_CODE`, `ANGEL_FEED_TOKEN`). Zero credentials are logged or written to binary logs.
+2. **`MATCHING ENGINE = SIMULATED EXCHANGE`**:
+   - The Limit Order Book and Matching Engine operate as a self-contained, in-memory, deterministic simulation.
+   - Execution fills represent passive/aggressive crossing against the local order book, not executions on the live exchange.
+   - Complete determinism is verified across replay, differential fuzzing, and multi-threaded SPSC pipelines.
+
+---
+
+### 13.2 Consolidated Master Performance Benchmark
+
+All measurements below were recorded on the release target machine (**13th Gen Intel Core i5-13420H @ 2.10 GHz, Windows 11 x64, MSVC 19.50 `/O2` Release build**):
+
+| Subsystem / Component | Workload Description | Throughput | Mean Latency | p50 Latency | p99 Latency | Hot-Path Allocs |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Pre-Trade Risk Engine** | Single-Order Ingress Validation | **90.22 M checks/s** | 11.1 ns | 5.0 ns | 15.0 ns | **0.00 allocs** |
+| **Market Data Decoder** | SmartStream Binary $\to$ `MarketEvent` | **11.95 M pkts/s** | 83.7 ns | 100.0 ns | 300.0 ns | **0.00 allocs** |
+| **SPSC Queue Transfer** | 1P / 1C Inter-Thread Ring Buffer | **27.17 M ev/s** | 36.8 ns | 20.0 ns | 70.0 ns | **0.00 allocs** |
+| **Market Data Transit** | `MarketEvent` (128B) $\to$ Ingress SPSC | **62.55 M ev/s** | 16.0 ns | 10.0 ns | 40.0 ns | **0.00 allocs** |
+| **Order Book (Flat)** | Dense Price Spread (10K mixed ops) | **9.53 M ops/s** | 104.9 ns | 200.0 ns | 700.0 ns | **0.00 allocs\*** |
+| **Matching Engine (Map)** | Reference Engine (100K mixed ops) | **7.40 M ops/s** | 135.1 ns | 200.0 ns | 800.0 ns | **0.00 allocs\*** |
+| **Binary Log Replay** | Raw `.hftlog` / `.mktlog` Stream Parse| **12.05 M ev/s** | 83.0 ns | 70.0 ns | 250.0 ns | **0.00 allocs** |
+| **Execution Pipeline** | Ingress $\to$ Risk $\to$ Gateway $\to$ Engine | **1.88 M ops/s** | 533.0 ns | 400.0 ns | 1,500.0 ns | **0.00 allocs\*** |
+
+*\* In reference OrderBook implementations, order pool recycling eliminates order allocation, with remaining allocations confined to std::unordered_map node creation during initial resting level insertion.*
+
+---
+
+### 13.3 Dynamic Heap Allocation Audit
+
+| Subsystem | Operation | Dynamic Allocations / Op | Verification Method |
+| :--- | :--- | :--- | :--- |
+| **Market Data** | WebSocket Packet Decoding | `0.00 allocs/pkt` | Direct byte parsing into preallocated `MarketEvent` |
+| **Market Data** | SPSC Event Transit | `0.00 allocs/event` | Fixed-capacity lock-free circular ring buffer |
+| **Market Data** | Binary `.mktlog` Recording | `0.00 allocs/event` | 64KB aligned stream buffer with monotonic offsets |
+| **Execution** | Pre-Trade Risk Checks | `0.00 allocs/check` | Inlined arithmetic and bound checking |
+| **Execution** | Risk Rejections | `0.00 allocs/rejection`| Direct `ExecutionReport` emission to egress SPSC |
+| **Execution** | SPSC Command/Report Transit | `0.00 allocs/op` | Cache-line aligned 64B structures in ring buffer |
+| **Execution** | Crossing Trade Execution | `0.00 allocs/trade` | Pre-reserved internal `Trade` buffer in `OrderGateway` |
+| **Execution** | Order Cancellation | `0.00 allocs/cancel`| Intrusive node unlinking in `OrderPool` |
+

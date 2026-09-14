@@ -27,18 +27,23 @@ void signal_handler(int) {
 void print_usage(const char* prog) {
     std::cout << "HFT Angel One SmartAPI Market Data Tool\n";
     std::cout << "Usage:\n";
-    std::cout << "  " << prog << " live [--mock] [token]                 Stream live or mock market data\n";
+    std::cout << "  " << prog << " live [--mock] [--seconds N] [token]     Stream live or mock market data\n";
     std::cout << "  " << prog << " record <output.mktlog> [--mock] [count] Record market data to binary log\n";
     std::cout << "  " << prog << " replay <input.mktlog>                  Replay recorded market data offline\n";
 }
 
-int cmd_live(bool mock_mode, uint32_t token) {
+int cmd_live(bool mock_mode, uint32_t token, uint32_t duration_sec = 0) {
     std::cout << "Starting market data stream (" << (mock_mode ? "MOCK FEED" : "LIVE ANGEL ONE") << ")...\n";
+    if (duration_sec > 0) {
+        std::cout << "Running for controlled duration: " << duration_sec << " seconds...\n";
+    }
 
     hft::MarketDataPipeline pipeline;
     pipeline.start();
 
     std::signal(SIGINT, signal_handler);
+
+    auto stream_start = std::chrono::steady_clock::now();
 
     if (mock_mode) {
         std::cout << "Streaming deterministic mock ticks for token " << token << " (Ctrl+C to stop)...\n";
@@ -49,6 +54,12 @@ int cmd_live(bool mock_mode, uint32_t token) {
         uint64_t last_consumed = 0;
 
         while (!g_shutdown.load() && idx < packets.size()) {
+            if (duration_sec > 0) {
+                auto curr = std::chrono::steady_clock::now();
+                if (std::chrono::duration<double>(curr - stream_start).count() >= duration_sec) {
+                    break;
+                }
+            }
             hft::MarketEvent ev{};
             uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -123,6 +134,12 @@ int cmd_live(bool mock_mode, uint32_t token) {
         uint64_t last_consumed = 0;
 
         while (!g_shutdown.load() && client.is_connected()) {
+            if (duration_sec > 0) {
+                auto curr = std::chrono::steady_clock::now();
+                if (std::chrono::duration<double>(curr - stream_start).count() >= duration_sec) {
+                    break;
+                }
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             auto now = std::chrono::steady_clock::now();
             double elapsed = std::chrono::duration<double>(now - last_report).count();
@@ -306,12 +323,15 @@ int main(int argc, char* argv[]) {
     if (mode == "live") {
         bool mock_mode = false;
         uint32_t token = 3045; // SBIN default
+        uint32_t duration_sec = 0;
         for (int i = 2; i < argc; ++i) {
             std::string arg = argv[i];
             if (arg == "--mock") mock_mode = true;
-            else token = static_cast<uint32_t>(std::stoul(arg));
+            else if (arg == "--seconds" && i + 1 < argc) {
+                duration_sec = static_cast<uint32_t>(std::stoul(argv[++i]));
+            } else token = static_cast<uint32_t>(std::stoul(arg));
         }
-        return cmd_live(mock_mode, token);
+        return cmd_live(mock_mode, token, duration_sec);
     } else if (mode == "record") {
         if (argc < 3) {
             print_usage(argv[0]);

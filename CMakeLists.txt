@@ -68,6 +68,12 @@ add_executable(hft_market_data
 )
 target_link_libraries(hft_market_data PRIVATE hft_core)
 
+# Unified execution pipeline and integrated demonstration executable
+add_executable(hft_pipeline_demo
+    examples/hft_pipeline_demo.cpp
+)
+target_link_libraries(hft_pipeline_demo PRIVATE hft_core)
+
 # Automated test suite executable
 add_executable(hft_tests
     tests/main.cpp
