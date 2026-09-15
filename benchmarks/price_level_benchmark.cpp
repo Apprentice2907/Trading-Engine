@@ -1,6 +1,7 @@
 #include "hft/types.hpp"
 #include "hft/order.hpp"
 #include "hft/order_book.hpp"
+#include "bench_timer.hpp"
 
 #include <iostream>
 #include <iomanip>

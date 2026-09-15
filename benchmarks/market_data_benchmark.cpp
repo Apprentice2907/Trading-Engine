@@ -1,5 +1,13 @@
+// market_data_benchmark.cpp — Angel One decoder and SPSC market-data throughput/latency benchmark.
+//
+// Methodology:
+//   Throughput : uninstrumented bulk loop (total_ops / wall_clock_seconds).
+//   Latency    : per-op TSC measurements. Mean, p50, p95, p99, max all
+//                derived from the SAME sorted raw sample array.
+
 #include "hft/market_data.hpp"
 #include "hft/spsc_queue.hpp"
+#include "bench_timer.hpp"
 
 #include <iostream>
 #include <iomanip>
@@ -43,64 +51,58 @@ void* operator new(size_t size) {
 }
 
 void operator delete(void* p) noexcept {
-    if (g_track_allocations && p) {
-        ++g_alloc_stats.dealloc_count;
-    }
+    if (g_track_allocations && p) ++g_alloc_stats.dealloc_count;
     std::free(p);
 }
 
 void operator delete(void* p, size_t) noexcept {
-    if (g_track_allocations && p) {
-        ++g_alloc_stats.dealloc_count;
+    if (g_track_allocations && p) ++g_alloc_stats.dealloc_count;
+    std::free(p);
+}
+
+void* operator new[](size_t size) {
+    if (g_track_allocations) {
+        ++g_alloc_stats.alloc_count;
+        g_alloc_stats.bytes_allocated += size;
     }
+    void* p = std::malloc(size);
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+
+void operator delete[](void* p) noexcept {
+    if (g_track_allocations && p) ++g_alloc_stats.dealloc_count;
+    std::free(p);
+}
+
+void operator delete[](void* p, size_t) noexcept {
+    if (g_track_allocations && p) ++g_alloc_stats.dealloc_count;
     std::free(p);
 }
 
 // ============================================================================
-// 2. Benchmark Utilities
+// 2. Main benchmark
 // ============================================================================
 
-using Clock = std::chrono::high_resolution_clock;
-
-struct LatencyStats {
-    double p50_ns{0.0};
-    double p99_ns{0.0};
-    double p999_ns{0.0};
-    double max_ns{0.0};
-    double mean_ns{0.0};
-};
-
-LatencyStats compute_percentiles(std::vector<double>& latencies_ns) {
-    if (latencies_ns.empty()) return {};
-    std::sort(latencies_ns.begin(), latencies_ns.end());
-    size_t n = latencies_ns.size();
-
-    double sum = 0.0;
-    for (double val : latencies_ns) sum += val;
-
-    LatencyStats s;
-    s.mean_ns = sum / static_cast<double>(n);
-    s.p50_ns  = latencies_ns[n * 50 / 100];
-    s.p99_ns  = latencies_ns[n * 99 / 100];
-    s.p999_ns = latencies_ns[n * 999 / 1000];
-    s.max_ns  = latencies_ns.back();
-    return s;
-}
-
-int main(int argc, char* argv[]) {
-    (void)argc;
-    (void)argv;
+int main() {
+    BenchTimer timer;
+    timer.calibrate(3, 50);
 
     std::cout << "=======================================================================================================\n";
-    std::cout << " LOW-LATENCY C++ EXCHANGE ENGINE: PHASE 7 ANGEL ONE MARKET DATA BENCHMARK\n";
-    std::cout << " Protocol: SmartStream Binary (Little-Endian) | Event: 128B MarketEvent (2 Cache Lines)\n";
+    std::cout << " LOW-LATENCY C++ — MARKET DATA DECODER & SPSC BENCHMARK\n";
+    std::cout << " Protocol: Angel One SmartStream Binary | MarketEvent: 128 bytes (2 cache lines)\n";
     std::cout << "=======================================================================================================\n\n";
+    std::cout << "Timer: TSC (empirical calibration) — " << std::fixed << std::setprecision(3)
+              << timer.tsc_ghz() << " GHz\n";
+    std::cout << "Note:  Throughput = total_ops / wall_clock_seconds (uninstrumented bulk loop)\n";
+    std::cout << "       Latency columns (mean/p50/p95/p99/max) all from the same TSC sample array\n\n";
 
-    // ------------------------------------------------------------------------
-    // Part 1: Allocation Verification
-    // ------------------------------------------------------------------------
-    std::cout << ">>> VERIFYING DYNAMIC HEAP ALLOCATIONS ON HOT PATH <<<\n";
+    // -------------------------------------------------------------------------
+    // Alloc verification
+    // -------------------------------------------------------------------------
+    std::cout << ">>> HOT-PATH ALLOCATION VERIFICATION <<<\n";
     {
+        constexpr size_t VERIFY_N = 50000;
         uint8_t packet[AngelConstants::PACKET_SIZE_SNAP_QUOTE]{0};
         MockAngelFeed::build_snap_quote_packet(
             packet, sizeof(packet), "3045", 83050, 100, 83045, 500, 83055, 600, 1, 1710000000000LL, 10000);
@@ -109,152 +111,153 @@ int main(int argc, char* argv[]) {
         hft::SpscQueue<hft::MarketEvent, 1024> queue;
 
         // Warmup
-        hft::broker::AngelDecoder::decode(packet, sizeof(packet), ev, 12345);
-        queue.try_push(ev);
-        queue.try_pop(ev);
-
-        g_alloc_stats.reset();
-        g_track_allocations = true;
-
-        const size_t test_ops = 50000;
-        for (size_t i = 0; i < test_ops; ++i) {
-            hft::broker::AngelDecoder::decode(packet, sizeof(packet), ev, i);
+        for (size_t i = 0; i < 1000; ++i) {
+            AngelDecoder::decode(packet, sizeof(packet), ev, i);
             queue.try_push(ev);
             queue.try_pop(ev);
         }
 
+        g_alloc_stats.reset();
+        g_track_allocations = true;
+        for (size_t i = 0; i < VERIFY_N; ++i) {
+            AngelDecoder::decode(packet, sizeof(packet), ev, i);
+            queue.try_push(ev);
+            queue.try_pop(ev);
+        }
         g_track_allocations = false;
-        double allocs_per_op = static_cast<double>(g_alloc_stats.alloc_count) / test_ops;
 
-        std::cout << "  Hot Path Allocs/Op: " << allocs_per_op << " allocs/op ("
-                  << g_alloc_stats.alloc_count << " total)\n";
+        std::cout << "  Decode + SPSC push/pop (" << VERIFY_N << " ops): "
+                  << g_alloc_stats.alloc_count << " heap allocations\n";
         if (g_alloc_stats.alloc_count == 0) {
-            std::cout << "  >>> RESULT: VERIFIED ZERO DYNAMIC ALLOCATIONS (0.00 allocs/event) <<<\n\n";
+            std::cout << "  RESULT: VERIFIED ZERO DYNAMIC ALLOCATIONS\n\n";
         } else {
-            std::cout << "  >>> WARNING: ALLOCATIONS DETECTED: " << g_alloc_stats.alloc_count << " <<<\n\n";
+            std::cout << "  WARNING: " << g_alloc_stats.alloc_count << " allocations detected\n\n";
         }
     }
 
-    const std::vector<size_t> test_scales = {100000, 1000000};
+    // -------------------------------------------------------------------------
+    // Per-scale benchmarks
+    // -------------------------------------------------------------------------
+    for (size_t count : {size_t{100000}, size_t{1000000}}) {
+        std::cout << "=== SCALE: " << count << " packets ===\n";
 
-    for (size_t count : test_scales) {
-        std::cout << "=======================================================================================================\n";
-        std::cout << " BENCHMARKING SCALE: " << count << " PACKETS / EVENTS\n";
-        std::cout << "=======================================================================================================\n";
+        auto packets = MockAngelFeed::generate_synthetic_stream(count, 0xABCDEFULL);
+        std::vector<hft::MarketEvent> events(count);
 
-        // Generate synthetic stream of raw packets
-        auto packets = hft::broker::MockAngelFeed::generate_synthetic_stream(count, 0xABCDEFULL);
-
-        // --------------------------------------------------------------------
-        // Benchmark A: Raw Decode + Normalization
-        // --------------------------------------------------------------------
-        std::vector<hft::MarketEvent> normalized_events(count);
-        std::vector<double> decode_latencies_ns;
-        if (count <= 100000) decode_latencies_ns.reserve(count);
-
-        auto dec_t0 = Clock::now();
-        for (size_t i = 0; i < count; ++i) {
-            if (count <= 100000) {
-                auto t_start = Clock::now();
-                hft::broker::AngelDecoder::decode(packets[i].data(), packets[i].size(), normalized_events[i], i);
-                auto t_end = Clock::now();
-                decode_latencies_ns.push_back(std::chrono::duration<double, std::nano>(t_end - t_start).count());
-            } else {
-                hft::broker::AngelDecoder::decode(packets[i].data(), packets[i].size(), normalized_events[i], i);
+        // -- A: Decoder throughput (bulk, uninstrumented) ---------------------
+        {
+            // Warmup
+            for (size_t i = 0; i < std::min(count / 10, size_t{5000}); ++i) {
+                AngelDecoder::decode(packets[i].data(), packets[i].size(), events[i], i);
             }
-        }
-        auto dec_t1 = Clock::now();
-        double dec_sec = std::chrono::duration<double>(dec_t1 - dec_t0).count();
-        double dec_tput = count / dec_sec / 1e6;
 
-        std::cout << "  [BENCHMARK A: DECODE + NORMALIZATION]\n";
-        std::cout << "    Throughput  : " << std::fixed << std::setprecision(2) << dec_tput << " M packets/sec\n";
-        std::cout << "    Avg Latency : " << std::fixed << std::setprecision(1) << (dec_sec * 1e9 / count) << " ns/packet\n";
-        if (!decode_latencies_ns.empty()) {
-            auto stats = compute_percentiles(decode_latencies_ns);
-            std::cout << "    Latency p50 : " << stats.p50_ns << " ns\n";
-            std::cout << "    Latency p99 : " << stats.p99_ns << " ns\n";
-            std::cout << "    Latency max : " << stats.max_ns << " ns\n";
+            auto t0 = std::chrono::steady_clock::now();
+            for (size_t i = 0; i < count; ++i) {
+                AngelDecoder::decode(packets[i].data(), packets[i].size(), events[i], i);
+            }
+            auto t1 = std::chrono::steady_clock::now();
+            double sec = std::chrono::duration<double>(t1 - t0).count();
+            std::cout << "  [A] Decoder throughput: "
+                      << std::fixed << std::setprecision(2) << (count / sec / 1e6) << " M pkts/s\n";
         }
 
-        // --------------------------------------------------------------------
-        // Benchmark B: MarketEvent -> SPSC Queue (Single-Threaded Burst)
-        // --------------------------------------------------------------------
-        hft::SpscQueue<hft::MarketEvent, 16384> spsc;
-        hft::MarketEvent dummy{};
+        // -- A: Decoder latency (per-op TSC, same samples for all stats) ------
+        {
+            const size_t N = std::min(count, size_t{100000});
+            LatencySampler sampler(N);
 
-        auto spsc_t0 = Clock::now();
-        for (size_t i = 0; i < count; ++i) {
-            while (!spsc.try_push(normalized_events[i])) {
+            // Warmup
+            for (size_t i = 0; i < std::min(N / 10, size_t{500}); ++i) {
+                AngelDecoder::decode(packets[i].data(), packets[i].size(), events[i], i);
+            }
+            for (size_t i = 0; i < N; ++i) {
+                auto t0 = timer.start();
+                AngelDecoder::decode(packets[i].data(), packets[i].size(), events[i], i);
+                sampler.record(timer.stop_ns(t0));
+            }
+            sampler.finish();
+            sampler.print_summary("Decoder latency (TSC, per-op samples):");
+        }
+
+        // -- B: SPSC push+pop throughput & latency ----------------------------
+        {
+            hft::SpscQueue<hft::MarketEvent, 16384> spsc;
+            hft::MarketEvent dummy{};
+            const size_t N = std::min(count, size_t{100000});
+            LatencySampler sampler(N);
+
+            // Warmup
+            for (size_t i = 0; i < std::min(N / 10, size_t{500}); ++i) {
+                spsc.try_push(events[i]);
                 spsc.try_pop(dummy);
             }
-            if (i % 8 == 0) {
+
+            auto t0_bulk = std::chrono::steady_clock::now();
+            for (size_t i = 0; i < count; ++i) {
+                while (!spsc.try_push(events[i % count])) {
+                    spsc.try_pop(dummy);
+                }
+                if (i % 8 == 0) spsc.try_pop(dummy);
+            }
+            while (spsc.try_pop(dummy)) {}
+            auto t1_bulk = std::chrono::steady_clock::now();
+            double bulk_sec = std::chrono::duration<double>(t1_bulk - t0_bulk).count();
+            std::cout << "  [B] SPSC push throughput: "
+                      << std::fixed << std::setprecision(2) << (count / bulk_sec / 1e6) << " M ev/s\n";
+
+            for (size_t i = 0; i < N; ++i) {
+                auto t0 = timer.start();
+                spsc.try_push(events[i]);
+                spsc.try_pop(dummy);
+                sampler.record(timer.stop_ns(t0));
+            }
+            sampler.finish();
+            sampler.print_summary("SPSC push+pop latency (TSC, per-op samples):");
+        }
+
+        // -- C: Binary recorder & replay throughput ---------------------------
+        {
+            const std::string fname = "bench_mkt_" + std::to_string(count) + ".mktlog";
+            hft::MarketEventRecorder recorder;
+            recorder.open(fname);
+
+            auto r0 = std::chrono::steady_clock::now();
+            for (const auto& ev : events) recorder.write(ev);
+            recorder.close();
+            auto r1 = std::chrono::steady_clock::now();
+            double rec_sec = std::chrono::duration<double>(r1 - r0).count();
+
+            uintmax_t fsz = 0;
+            try { fsz = std::filesystem::file_size(fname); } catch (...) {}
+
+            std::cout << "  [C.1] .mktlog record: " << std::fixed << std::setprecision(2)
+                      << (count / rec_sec / 1e6) << " M ev/s  (" << (fsz / 1024.0 / 1024.0) << " MB)\n";
+
+            hft::MarketEventReplayer replayer;
+            replayer.open(fname);
+            hft::SpscQueue<hft::MarketEvent, 16384> spsc;
+            hft::MarketEvent rdev{}, dummy{};
+
+            auto p0 = std::chrono::steady_clock::now();
+            while (replayer.next(rdev)) {
+                while (!spsc.try_push(rdev)) spsc.try_pop(dummy);
                 spsc.try_pop(dummy);
             }
+            while (spsc.try_pop(dummy)) {}
+            auto p1 = std::chrono::steady_clock::now();
+            double rep_sec = std::chrono::duration<double>(p1 - p0).count();
+            replayer.close();
+            std::filesystem::remove(fname);
+
+            std::cout << "  [C.2] .mktlog replay: " << std::fixed << std::setprecision(2)
+                      << (count / rep_sec / 1e6) << " M ev/s\n";
         }
-        while (spsc.try_pop(dummy)) {}
-        auto spsc_t1 = Clock::now();
 
-        double spsc_sec = std::chrono::duration<double>(spsc_t1 - spsc_t0).count();
-        double spsc_tput = count / spsc_sec / 1e6;
-
-        std::cout << "\n  [BENCHMARK B: MARKET EVENT -> SPSC QUEUE]\n";
-        std::cout << "    Throughput  : " << std::fixed << std::setprecision(2) << spsc_tput << " M events/sec\n";
-        std::cout << "    Avg Latency : " << std::fixed << std::setprecision(1) << (spsc_sec * 1e9 / count) << " ns/event\n";
-
-        // --------------------------------------------------------------------
-        // Benchmark C: Binary Recording (.mktlog) & Replay -> SPSC
-        // --------------------------------------------------------------------
-        const std::string mkt_file = "bench_temp_" + std::to_string(count) + ".mktlog";
-
-        // 1. Recording
-        hft::MarketEventRecorder recorder;
-        recorder.open(mkt_file);
-        auto rec_t0 = Clock::now();
-        for (const auto& ev : normalized_events) {
-            recorder.write(ev);
-        }
-        recorder.close();
-        auto rec_t1 = Clock::now();
-        double rec_sec = std::chrono::duration<double>(rec_t1 - rec_t0).count();
-        double rec_tput = count / rec_sec / 1e6;
-        uintmax_t file_bytes = std::filesystem::file_size(mkt_file);
-
-        std::cout << "\n  [BENCHMARK C.1: .MKTLOG BINARY RECORDING]\n";
-        std::cout << "    Throughput  : " << std::fixed << std::setprecision(2) << rec_tput << " M events/sec ("
-                  << (file_bytes / (rec_sec * 1024.0 * 1024.0)) << " MB/sec)\n";
-        std::cout << "    File Size   : " << (file_bytes / (1024.0 * 1024.0)) << " MB (" << file_bytes << " bytes)\n";
-        std::cout << "    Density     : " << (static_cast<double>(file_bytes) / count) << " bytes/event\n";
-
-        // 2. Replay -> SPSC
-        hft::MarketEventReplayer replayer;
-        replayer.open(mkt_file);
-        hft::MarketEvent read_ev{};
-
-        auto rep_t0 = Clock::now();
-        while (replayer.next(read_ev)) {
-            while (!spsc.try_push(read_ev)) {
-                spsc.try_pop(dummy);
-            }
-            spsc.try_pop(dummy);
-        }
-        while (spsc.try_pop(dummy)) {}
-        auto rep_t1 = Clock::now();
-        double rep_sec = std::chrono::duration<double>(rep_t1 - rep_t0).count();
-        double rep_tput = count / rep_sec / 1e6;
-        replayer.close();
-
-        std::cout << "\n  [BENCHMARK C.2: REPLAY .MKTLOG -> SPSC]\n";
-        std::cout << "    Throughput  : " << std::fixed << std::setprecision(2) << rep_tput << " M events/sec\n";
-        std::cout << "    Avg Latency : " << std::fixed << std::setprecision(1) << (rep_sec * 1e9 / count) << " ns/event\n";
-
-        std::filesystem::remove(mkt_file);
         std::cout << "\n";
     }
 
     std::cout << "=======================================================================================================\n";
-    std::cout << " PHASE 7 MARKET DATA BENCHMARK COMPLETE\n";
+    std::cout << " MARKET DATA BENCHMARK COMPLETE\n";
     std::cout << "=======================================================================================================\n";
-
     return 0;
 }

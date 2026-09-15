@@ -2,6 +2,7 @@
 #include "hft/trading_pipeline.hpp"
 #include "hft/matching_engine.hpp"
 #include "hft/spsc_queue.hpp"
+#include "bench_timer.hpp"
 
 #include <iostream>
 #include <iomanip>
@@ -57,37 +58,13 @@ void operator delete(void* p, size_t) noexcept {
 }
 
 // ============================================================================
-// 2. Percentiles & Timing Utilities
-// ============================================================================
+// Benchmarks A/B/C/D: 'Avg Latency' = wall_clock_total / N (amortized throughput-derived period,
+// NOT a per-op sampled latency distribution). See Benchmark E for TSC-sampled per-op latency.
+//
+// Benchmark E: Mean, p50, p95, p99, max all derived from the same TSC sample array.
 
-using Clock = std::chrono::high_resolution_clock;
+using Clock = std::chrono::steady_clock;
 
-struct LatencyStats {
-    double mean_ns{0.0};
-    double p50_ns{0.0};
-    double p95_ns{0.0};
-    double p99_ns{0.0};
-    double p999_ns{0.0};
-    double max_ns{0.0};
-};
-
-LatencyStats compute_percentiles(std::vector<double>& latencies_ns) {
-    if (latencies_ns.empty()) return {};
-    std::sort(latencies_ns.begin(), latencies_ns.end());
-    const size_t n = latencies_ns.size();
-
-    double sum = 0.0;
-    for (double v : latencies_ns) sum += v;
-
-    LatencyStats s;
-    s.mean_ns = sum / static_cast<double>(n);
-    s.p50_ns  = latencies_ns[n * 50 / 100];
-    s.p95_ns  = latencies_ns[n * 95 / 100];
-    s.p99_ns  = latencies_ns[n * 99 / 100];
-    s.p999_ns = latencies_ns[n * 999 / 1000];
-    s.max_ns  = latencies_ns.back();
-    return s;
-}
 
 // ============================================================================
 // 3. Main Benchmark Driver
@@ -97,10 +74,18 @@ int main(int argc, char* argv[]) {
     (void)argc;
     (void)argv;
 
+    BenchTimer bench_timer;
+    bench_timer.calibrate(3, 50);
+
     std::cout << "=======================================================================================================\n";
-    std::cout << " LOW-LATENCY C++ EXCHANGE ENGINE: PHASE 8 ORDER GATEWAY & PRE-TRADE RISK BENCHMARK\n";
+    std::cout << " LOW-LATENCY C++ — ORDER GATEWAY & PRE-TRADE RISK BENCHMARK\n";
     std::cout << " Pipeline: OrderCommand(64B) -> PreTradeRisk -> OrderGateway -> MatchingEngine -> ExecutionReport(64B)\n";
     std::cout << "=======================================================================================================\n\n";
+    std::cout << "Timer: TSC (empirical calibration) — " << std::fixed << std::setprecision(3)
+              << bench_timer.tsc_ghz() << " GHz\n";
+    std::cout << "Note: Benchmarks A/B/C/D report throughput + amortized period (total_time/N).\n";
+    std::cout << "      Benchmark E reports per-op TSC-sampled latency: mean/p50/p95/p99/max\n"
+              << "      all derived from the same raw sample array.\n\n";
 
     // ------------------------------------------------------------------------
     // Part 1: Comprehensive Dynamic Heap Allocation Audit
@@ -313,9 +298,9 @@ int main(int argc, char* argv[]) {
             const double avg_ns = (elapsed_s * 1e9) / count;
 
             std::cout << "  [BENCHMARK A: PRE-TRADE RISK CHECK ONLY]\n";
-            std::cout << "    Throughput  : " << std::fixed << std::setprecision(2) << mops << " M checks/sec\n";
-            std::cout << "    Avg Latency : " << std::fixed << std::setprecision(1) << avg_ns << " ns/check\n";
-            std::cout << "    Approved    : " << approved << " / " << count << "\n";
+            std::cout << "    Throughput    : " << std::fixed << std::setprecision(2) << mops << " M checks/sec\n";
+            std::cout << "    Amort. Period : " << std::fixed << std::setprecision(1) << avg_ns << " ns/check (throughput-derived)\n";
+            std::cout << "    Approved      : " << approved << " / " << count << "\n";
         }
 
         // Benchmark B: Resting Limit Orders (Risk + Gateway + Matching)
@@ -347,9 +332,9 @@ int main(int argc, char* argv[]) {
             const double avg_ns = (elapsed_s * 1e9) / count;
 
             std::cout << "  [BENCHMARK B: RESTING ORDERS (RISK + GATEWAY + MATCHING)]\n";
-            std::cout << "    Throughput  : " << std::fixed << std::setprecision(2) << mops << " M orders/sec\n";
-            std::cout << "    Avg Latency : " << std::fixed << std::setprecision(1) << avg_ns << " ns/order\n";
-            std::cout << "    Reports Out : " << reports_emitted << "\n";
+            std::cout << "    Throughput    : " << std::fixed << std::setprecision(2) << mops << " M orders/sec\n";
+            std::cout << "    Amort. Period : " << std::fixed << std::setprecision(1) << avg_ns << " ns/order (throughput-derived)\n";
+            std::cout << "    Reports Out   : " << reports_emitted << "\n";
         }
 
         // Benchmark C: Match-Heavy Crossing Orders (Aggressive Fill Execution)
@@ -392,9 +377,9 @@ int main(int argc, char* argv[]) {
             const double avg_ns = (elapsed_s * 1e9) / buy_commands.size();
 
             std::cout << "  [BENCHMARK C: MATCH-HEAVY EXECUTION (CROSSING ORDERS)]\n";
-            std::cout << "    Throughput  : " << std::fixed << std::setprecision(2) << mops << " M orders/sec\n";
-            std::cout << "    Avg Latency : " << std::fixed << std::setprecision(1) << avg_ns << " ns/order\n";
-            std::cout << "    Trades Made : " << trade_reports << "\n";
+            std::cout << "    Throughput    : " << std::fixed << std::setprecision(2) << mops << " M orders/sec\n";
+            std::cout << "    Amort. Period : " << std::fixed << std::setprecision(1) << avg_ns << " ns/order (throughput-derived)\n";
+            std::cout << "    Trades Made   : " << trade_reports << "\n";
         }
 
         // Benchmark D: Mixed Realistic Workload (60% Adds, 25% Cancels, 15% Crosses)
@@ -441,39 +426,38 @@ int main(int argc, char* argv[]) {
             const double avg_ns = (elapsed_s * 1e9) / count;
 
             std::cout << "  [BENCHMARK D: MIXED WORKLOAD (60% ADDS, 25% CANCELS, 15% CROSSES)]\n";
-            std::cout << "    Throughput  : " << std::fixed << std::setprecision(2) << mops << " M ops/sec\n";
-            std::cout << "    Avg Latency : " << std::fixed << std::setprecision(1) << avg_ns << " ns/op\n";
+            std::cout << "    Throughput    : " << std::fixed << std::setprecision(2) << mops << " M ops/sec\n";
+            std::cout << "    Amort. Period : " << std::fixed << std::setprecision(1) << avg_ns << " ns/op (throughput-derived)\n";
         }
 
         // Benchmark E: Stage Latencies (p50, p95, p99, p99.9, max)
         if (count == 100000) {
+            // Benchmark E uses TSC for per-op latency. Warmup first to prime icache.
+            // Mean and all percentiles derived from the same raw sample array.
             PreTradeRiskEngine risk(scaled_cfg);
             OrderGateway gateway(128);
             MatchingEngine engine;
-            engine.reserve(count + 1000);
+            engine.reserve(count + 5000);
 
-            std::vector<double> latencies;
-            latencies.reserve(count);
+            const size_t warmup_e = std::min(count / 10, size_t{2000});
+            for (size_t i = 1; i <= warmup_e; ++i) {
+                OrderCommand cmd = OrderCommand::make_add(
+                    i, 3045, 1, Side::Buy, 80000 + static_cast<Price>(i % 50), 10);
+                gateway.process_command(cmd, risk, engine, [](const ExecutionReport&) noexcept {});
+            }
 
-            for (size_t i = 1; i <= count; ++i) {
+            LatencySampler sampler_e(count);
+            for (size_t i = warmup_e + 1; i <= warmup_e + count; ++i) {
                 OrderCommand cmd = OrderCommand::make_add(
                     i, 3045, 1, Side::Buy, 80000 + static_cast<Price>(i % 50), 10);
 
-                const auto t0 = Clock::now();
+                auto t0 = bench_timer.start();
                 gateway.process_command(cmd, risk, engine, [](const ExecutionReport&) noexcept {});
-                const auto t1 = Clock::now();
-
-                latencies.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count());
+                sampler_e.record(bench_timer.stop_ns(t0));
             }
-
-            LatencyStats st = compute_percentiles(latencies);
-            std::cout << "  [BENCHMARK E: STAGE LATENCY PERCENTILES (100K SAMPLES)]\n";
-            std::cout << "    Mean Latency : " << std::fixed << std::setprecision(1) << st.mean_ns << " ns\n";
-            std::cout << "    Latency p50  : " << st.p50_ns << " ns\n";
-            std::cout << "    Latency p95  : " << st.p95_ns << " ns\n";
-            std::cout << "    Latency p99  : " << st.p99_ns << " ns\n";
-            std::cout << "    Latency p99.9: " << st.p999_ns << " ns\n";
-            std::cout << "    Latency max  : " << st.max_ns << " ns\n";
+            sampler_e.finish();
+            std::cout << "  [BENCHMARK E: TSC-SAMPLED LATENCY DISTRIBUTION (" << count << " samples)]\n";
+            sampler_e.print_summary("  Risk + Gateway + Engine:");
         }
 
         std::cout << "\n";

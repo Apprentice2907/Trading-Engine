@@ -1,5 +1,6 @@
 #include "hft/order.hpp"
 #include "hft/spsc_queue.hpp"
+#include "bench_timer.hpp"
 
 #include <iostream>
 #include <iomanip>
@@ -9,10 +10,11 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <type_traits>
 #include <cstdlib>
 #include <new>
 
-#ifdef _WIN32
+#if defined(_WIN32)
 #include <windows.h>
 #endif
 
@@ -151,7 +153,10 @@ struct QueueBenchResult {
     uint64_t events_transferred{0};
     double elapsed_sec{0.0};
     double throughput_mevents_per_sec{0.0};
-    double avg_latency_ns{0.0};
+    // amortized_period_ns = wall_clock / N. This is a throughput-derived
+    // amortised period, NOT a per-operation sampled latency.
+    // Use per-op TSC sampling for accurate latency distributions.
+    double amortized_period_ns{0.0};
 };
 
 template <typename QueueT>
@@ -228,7 +233,7 @@ QueueBenchResult benchmark_queue_1p1c(const std::string& name, size_t capacity, 
     res.events_transferred = total_events;
     res.elapsed_sec = sec;
     res.throughput_mevents_per_sec = (static_cast<double>(total_events) / sec) / 1e6;
-    res.avg_latency_ns = (sec / static_cast<double>(total_events)) * 1e9;
+    res.amortized_period_ns = (sec / static_cast<double>(total_events)) * 1e9;
     return res;
 }
 
@@ -243,9 +248,11 @@ struct SpscQueueWrapper {
 
 void run_queue_microbenchmark() {
     std::cout << "===================================================================================\n";
-    std::cout << " STEP 6 & 11: QUEUE MICROBENCHMARK (1 Producer / 1 Consumer Concurrent Transfer)\n";
-    std::cout << " Testing: SPSC (Cache-Aligned) vs SPSC (Unaligned / False Sharing) vs Mutex+Queue\n";
+    std::cout << " QUEUE MICROBENCHMARK (1 Producer / 1 Consumer Concurrent Transfer)\n";
+    std::cout << " Testing: SPSC (Cache-Aligned) vs SPSC (Unaligned) vs Mutex+std::queue\n";
     std::cout << " Capacities: 256, 1024, 4096, 16384 | 2 Million Events Transferred\n";
+    std::cout << " Note: 'Period' column = wall_clock / N (throughput-derived amortized period,\n";
+    std::cout << "        not a sampled per-op latency distribution)\n";
     std::cout << "===================================================================================\n";
 
     constexpr uint64_t Events = 2000000;
@@ -255,7 +262,7 @@ void run_queue_microbenchmark() {
               << std::setw(11) << "Capacity"
               << std::setw(16) << "Elapsed (ms)"
               << std::setw(24) << "Throughput (M ev/s)"
-              << "Avg Latency (ns)\n";
+              << "Amortized Period (ns)\n";
     std::cout << "-----------------------------------------------------------------------------------\n";
 
     auto test_capacity = [&](auto cap_tag) {
@@ -268,7 +275,7 @@ void run_queue_microbenchmark() {
                   << std::setw(11) << r_aligned.capacity
                   << std::setw(16) << std::fixed << std::setprecision(2) << (r_aligned.elapsed_sec * 1000.0)
                   << std::setw(24) << std::setprecision(2) << r_aligned.throughput_mevents_per_sec
-                  << std::setprecision(1) << r_aligned.avg_latency_ns << " ns\n";
+                  << std::setprecision(1) << r_aligned.amortized_period_ns << " ns\n";
 
         // 2. SPSC Unaligned (Testing false sharing)
         auto r_unaligned = benchmark_queue_1p1c<SpscQueueWrapper<C, false>>("SPSC (Unaligned)", C, Events, false);
@@ -277,7 +284,7 @@ void run_queue_microbenchmark() {
                   << std::setw(11) << r_unaligned.capacity
                   << std::setw(16) << std::fixed << std::setprecision(2) << (r_unaligned.elapsed_sec * 1000.0)
                   << std::setw(24) << std::setprecision(2) << r_unaligned.throughput_mevents_per_sec
-                  << std::setprecision(1) << r_unaligned.avg_latency_ns << " ns\n";
+                  << std::setprecision(1) << r_unaligned.amortized_period_ns << " ns\n";
 
         // 3. Mutex + std::queue
         auto r_mutex = benchmark_queue_1p1c<MutexQueue<hft::OrderEvent>>("std::mutex + queue", C, Events, false);
@@ -286,7 +293,7 @@ void run_queue_microbenchmark() {
                   << std::setw(11) << r_mutex.capacity
                   << std::setw(16) << std::fixed << std::setprecision(2) << (r_mutex.elapsed_sec * 1000.0)
                   << std::setw(24) << std::setprecision(2) << r_mutex.throughput_mevents_per_sec
-                  << std::setprecision(1) << r_mutex.avg_latency_ns << " ns\n";
+                  << std::setprecision(1) << r_mutex.amortized_period_ns << " ns\n";
 
         std::cout << "-----------------------------------------------------------------------------------\n";
     };
@@ -302,11 +309,11 @@ void run_queue_microbenchmark() {
     auto r_pinned = benchmark_queue_1p1c<SpscQueueWrapper<4096, true>>("SPSC (CPU Pinned)", 4096, Events, true);
 
     std::cout << "  Unpinned Scheduling : " << std::fixed << std::setprecision(2)
-              << r_unpinned.throughput_mevents_per_sec << " M events/sec ("
-              << std::setprecision(1) << r_unpinned.avg_latency_ns << " ns/event)\n";
+              << r_unpinned.throughput_mevents_per_sec << " M events/sec (amortized "
+              << std::setprecision(1) << r_unpinned.amortized_period_ns << " ns/event)\n";
     std::cout << "  Pinned Scheduling   : " << std::fixed << std::setprecision(2)
-              << r_pinned.throughput_mevents_per_sec << " M events/sec ("
-              << std::setprecision(1) << r_pinned.avg_latency_ns << " ns/event)\n";
+              << r_pinned.throughput_mevents_per_sec << " M events/sec (amortized "
+              << std::setprecision(1) << r_pinned.amortized_period_ns << " ns/event)\n";
 
     const double pin_speedup = ((r_pinned.throughput_mevents_per_sec - r_unpinned.throughput_mevents_per_sec)
                                / r_unpinned.throughput_mevents_per_sec) * 100.0;

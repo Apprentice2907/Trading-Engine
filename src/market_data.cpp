@@ -17,11 +17,18 @@ namespace hft {
 namespace broker {
 
 uint32_t AngelDecoder::parse_token(const char* token_bytes, size_t max_len) noexcept {
+    // Parse at most 9 decimal digits to prevent uint32_t overflow.
+    // 10 digits of all-9s = 9,999,999,999 which exceeds UINT32_MAX (4,294,967,295).
+    // 9 digits max = 999,999,999 which is always safe.
+    static constexpr size_t MAX_SAFE_DIGITS = 9;
     uint32_t token = 0;
+    size_t digits = 0;
     for (size_t i = 0; i < max_len && token_bytes[i] != '\0'; ++i) {
         char c = token_bytes[i];
         if (c >= '0' && c <= '9') {
-            token = token * 10 + static_cast<uint32_t>(c - '0');
+            if (digits >= MAX_SAFE_DIGITS) break; // truncate silently, avoids overflow
+            token = token * 10u + static_cast<uint32_t>(c - '0');
+            ++digits;
         }
     }
     return token;
@@ -29,53 +36,77 @@ uint32_t AngelDecoder::parse_token(const char* token_bytes, size_t max_len) noex
 
 bool AngelDecoder::decode(const uint8_t* data, size_t length, MarketEvent& out_event,
                           uint64_t receive_ts_ns) noexcept {
+    // Require at least the smallest valid packet size before touching any byte.
     if (data == nullptr || length < AngelConstants::PACKET_SIZE_LTP) {
         return false;
     }
 
-    const uint8_t mode = data[0];
+    const uint8_t mode     = data[0];
     const uint8_t exchange = data[1];
 
+    // Validate mode and require the actual buffer covers the full packet for that mode.
     if (mode == AngelConstants::MODE_LTP) {
-        if (length < AngelConstants::PACKET_SIZE_LTP) return false;
+        // length >= PACKET_SIZE_LTP already verified above; no additional check needed.
     } else if (mode == AngelConstants::MODE_QUOTE) {
         if (length < AngelConstants::PACKET_SIZE_QUOTE) return false;
     } else if (mode == AngelConstants::MODE_SNAP_QUOTE) {
         if (length < AngelConstants::PACKET_SIZE_SNAP_QUOTE) return false;
     } else {
+        // Unknown or unsupported mode (0, 4=Depth, 255, etc.) — reject safely.
         return false;
     }
 
-    const uint32_t token = parse_token(reinterpret_cast<const char*>(data + 2), 25);
-    const uint64_t seq = read_u64_le(data + 27);
-    const int64_t ts_ms = read_i64_le(data + 35);
-    const int64_t ltp_paise = read_i64_le(data + 43);
+    // Validate exchange type is a known value (1–5 and 7, 13).
+    // Unknown exchange bytes are accepted for forward-compatibility but flagged
+    // by setting exchange_type to 0 so callers can detect it.
+    const uint8_t safe_exchange = (exchange == AngelConstants::EXCH_NSE_CM ||
+                                   exchange == AngelConstants::EXCH_NSE_FO ||
+                                   exchange == AngelConstants::EXCH_BSE_CM ||
+                                   exchange == AngelConstants::EXCH_BSE_FO ||
+                                   exchange == AngelConstants::EXCH_MCX_FO ||
+                                   exchange == AngelConstants::EXCH_NCX_FO ||
+                                   exchange == AngelConstants::EXCH_CDE_FO)
+                                      ? exchange : 0;
 
+    // All offsets below are safe because we validated length >= required size above:
+    //   LTP:        offsets 0..50   (size 51)
+    //   Quote:      offsets 0..146  (size 147)
+    //   SnapQuote:  offsets 0..346  (size 347); depth reads at 147+10=157, 247+10=257 — both < 347.
+    const uint32_t token      = parse_token(reinterpret_cast<const char*>(data + 2), 25);
+    const uint64_t seq        = read_u64_le(data + 27);
+    const int64_t  ts_ms      = read_i64_le(data + 35);
+    const int64_t  ltp_paise  = read_i64_le(data + 43);
+
+    // Clamp timestamp: negative timestamps are invalid; very large values are passed through.
     const uint64_t exch_ts_ns = (ts_ms > 0)
         ? static_cast<uint64_t>(ts_ms) * 1000000ULL
         : 0ULL;
 
-    out_event.instrument_token = token;
-    out_event.exchange_type = exchange;
+    out_event.instrument_token  = token;
+    out_event.exchange_type     = safe_exchange;
     out_event.subscription_mode = mode;
-    out_event.pad = 0;
-    out_event.sequence_number = seq;
+    out_event.pad               = 0;
+    out_event.sequence_number   = seq;
     out_event.exchange_timestamp = exch_ts_ns;
-    out_event.receive_timestamp = receive_ts_ns;
-    out_event.last_price = ltp_paise;
-    out_event.last_quantity = 0;
-    out_event.best_bid_price = 0;
+    out_event.receive_timestamp  = receive_ts_ns;
+    out_event.last_price        = ltp_paise;
+    out_event.last_quantity     = 0;
+    out_event.best_bid_price    = 0;
     out_event.best_bid_quantity = 0;
-    out_event.best_ask_price = 0;
+    out_event.best_ask_price    = 0;
     out_event.best_ask_quantity = 0;
-    out_event.volume = 0;
+    out_event.volume            = 0;
 
     if (mode == AngelConstants::MODE_QUOTE || mode == AngelConstants::MODE_SNAP_QUOTE) {
+        // Offsets 51..74 (last_qty @ 51, volume @ 67) — within 147-byte Quote packet.
         out_event.last_quantity = read_u64_le(data + 51);
         out_event.volume        = read_u64_le(data + 67);
     }
 
     if (mode == AngelConstants::MODE_SNAP_QUOTE) {
+        // Depth level 0 bid/ask: within 347-byte SnapQuote packet.
+        // bid_qty  @ 149, bid_price @ 157 — within [0, 346].
+        // ask_qty  @ 249, ask_price @ 257 — within [0, 346].
         out_event.best_bid_quantity = read_u64_le(data + 147 + 2);
         out_event.best_bid_price    = read_i64_le(data + 147 + 10);
         out_event.best_ask_quantity = read_u64_le(data + 247 + 2);

@@ -1,5 +1,21 @@
+// benchmark.cpp — Matching engine throughput and latency benchmark.
+//
+// Methodology:
+//   Throughput  : Uninstrumented bulk loop (no clock calls inside hot path).
+//                 Reported as: total_ops / wall_clock_seconds.
+//   Latency     : Per-operation TSC measurements collected into a raw sample
+//                 array. Mean, p50, p95, p99, and max are ALL computed from
+//                 the same sorted sample array — preventing the mean < p50
+//                 inconsistency that arises when throughput-derived averages
+//                 are mixed with separately measured percentiles.
+//
+// Timer: TSC via __rdtsc() + _mm_lfence() with empirical frequency calibration
+//        (50 ms sleep against steady_clock). Falls back to steady_clock on
+//        non-x86 platforms.
+
 #include "hft/matching_engine.hpp"
 #include "hft/flat_order_book.hpp"
+#include "bench_timer.hpp"
 
 #include <iostream>
 #include <iomanip>
@@ -78,7 +94,7 @@ void operator delete[](void* p, size_t) noexcept {
 }
 
 // ============================================================================
-// 2. Deterministic Workload Definitions & Generator
+// 2. Deterministic Workload Generator
 // ============================================================================
 
 enum class OpType : uint8_t {
@@ -144,12 +160,10 @@ public:
         for (size_t i = 0; i < count; ++i) {
             hft::OrderId id = next_id++;
             if (i % 2 == 0) {
-                // Passive resting ask @ 10000..10020
                 hft::Price price = static_cast<hft::Price>(next_range(10000, 10020));
                 hft::Quantity qty = static_cast<hft::Quantity>(next_range(10, 50));
                 ops.push_back(BenchmarkOp{OpType::SubmitLimit, id, hft::Side::Sell, price, qty});
             } else {
-                // Aggressive crossing buy @ 10030 (sweeps asks)
                 hft::Price price = static_cast<hft::Price>(next_range(10020, 10030));
                 hft::Quantity qty = static_cast<hft::Quantity>(next_range(10, 60));
                 ops.push_back(BenchmarkOp{OpType::SubmitLimit, id, hft::Side::Buy, price, qty});
@@ -233,224 +247,207 @@ private:
 };
 
 // ============================================================================
-// 3. Benchmark Execution & Metrics
+// 3. Benchmark Execution
 // ============================================================================
 
 struct BenchmarkResult {
     std::string engine_type;
     std::string workload_name;
-    size_t operation_count{0};
-    double elapsed_seconds{0.0};
-    double throughput_mops{0.0};
-    uint64_t p50_ns{0};
-    uint64_t p95_ns{0};
-    uint64_t p99_ns{0};
-    uint64_t p999_ns{0};
-    uint64_t max_ns{0};
+    size_t  operation_count{0};
+    double  throughput_mops{0.0};  // From uninstrumented bulk loop
+    double  mean_ns{0.0};          // From per-op TSC sample array
+    double  p50_ns{0.0};           // From same per-op TSC sample array
+    double  p95_ns{0.0};
+    double  p99_ns{0.0};
+    double  p999_ns{0.0};
+    double  max_ns{0.0};
     uint64_t total_trades{0};
-    double allocs_per_op{0.0};
-    double deallocs_per_op{0.0};
-    double bytes_per_op{0.0};
+    double  allocs_per_op{0.0};
 };
+
+// Execute a single workload operation on the engine.
+template <typename EngineT>
+inline void run_op(EngineT& engine, const BenchmarkOp& op, std::vector<hft::Trade>& trades) {
+    switch (op.type) {
+        case OpType::SubmitLimit:
+            engine.submit_limit_order(op.id, op.side, op.price, op.qty, trades);
+            trades.clear();
+            break;
+        case OpType::Cancel:
+            engine.cancel_order(op.id);
+            break;
+        case OpType::Modify:
+            engine.modify_order(op.id, op.price, op.qty, trades);
+            trades.clear();
+            break;
+    }
+}
 
 class BenchmarkRunner {
 public:
-    using Clock = std::chrono::steady_clock;
-
-    static double measure_timer_overhead_ns() {
-        constexpr size_t iterations = 1000000;
-        auto start = Clock::now();
-        for (size_t i = 0; i < iterations; ++i) {
-            auto t = Clock::now();
-            (void)t;
-        }
-        auto end = Clock::now();
-        std::chrono::duration<double, std::nano> elapsed = end - start;
-        return elapsed.count() / static_cast<double>(iterations);
-    }
-
     template <typename EngineT>
-    static BenchmarkResult run(const std::string& engine_type, const std::string& name,
-                               const std::vector<BenchmarkOp>& ops, bool pre_reserve = false) {
+    static BenchmarkResult run(BenchTimer& timer,
+                               const std::string& engine_type,
+                               const std::string& name,
+                               const std::vector<BenchmarkOp>& ops,
+                               bool pre_reserve = false) {
         const size_t count = ops.size();
+        const size_t warmup_count = std::min(count / 10, size_t{5000});
+        const size_t latency_samples = std::min(count, size_t{200000});
 
-        // 1. Allocation Measurement Run (on sample size)
+        // ------------------------------------------------------------------
+        // 1. Allocation check: warmup then track.
+        // ------------------------------------------------------------------
         AllocStats alloc_res;
         {
             EngineT engine;
-            if constexpr (std::is_same_v<EngineT, hft::MatchingEngine> || std::is_same_v<EngineT, hft::FlatMatchingEngine>) {
-                if (pre_reserve) {
-                    engine.reserve(count);
-                }
+            if constexpr (std::is_same_v<EngineT, hft::MatchingEngine> ||
+                          std::is_same_v<EngineT, hft::FlatMatchingEngine>) {
+                if (pre_reserve) engine.reserve(count);
             }
-
             std::vector<hft::Trade> trades;
             trades.reserve(128);
 
-            const size_t alloc_sample_size = std::min(count, size_t{50000});
-            g_alloc_stats.reset();
-            g_track_allocations = true;
-
-            for (size_t i = 0; i < alloc_sample_size; ++i) {
-                const auto& op = ops[i];
-                switch (op.type) {
-                    case OpType::SubmitLimit:
-                        engine.submit_limit_order(op.id, op.side, op.price, op.qty, trades);
-                        trades.clear();
-                        break;
-                    case OpType::Cancel:
-                        engine.cancel_order(op.id);
-                        break;
-                    case OpType::Modify:
-                        engine.modify_order(op.id, op.price, op.qty, trades);
-                        trades.clear();
-                        break;
-                }
+            // Warmup (excluded from alloc tracking)
+            for (size_t i = 0; i < warmup_count; ++i) {
+                run_op(engine, ops[i % count], trades);
             }
 
+            const size_t alloc_sample_size = std::min(count - warmup_count, size_t{50000});
+            g_alloc_stats.reset();
+            g_track_allocations = true;
+            for (size_t i = warmup_count; i < warmup_count + alloc_sample_size; ++i) {
+                run_op(engine, ops[i], trades);
+            }
             g_track_allocations = false;
             alloc_res = g_alloc_stats;
         }
 
-        // 2. Pure Throughput Run (Zero timing overhead inside hot path)
+        // ------------------------------------------------------------------
+        // 2. Throughput: uninstrumented bulk loop, no clock calls inside.
+        //    Reported as total_ops / wall_clock_seconds. This is throughput —
+        //    NOT the same as per-operation latency.
+        // ------------------------------------------------------------------
         double best_elapsed_sec = 1e9;
-        uint64_t final_trades_count = 0;
+        uint64_t final_trades = 0;
+        const int tput_iters = (count >= 1000000) ? 1 : 3;
 
-        const int iterations = (count >= 10000000) ? 1 : 3;
-        for (int iter = 0; iter < iterations; ++iter) {
+        for (int iter = 0; iter < tput_iters; ++iter) {
             EngineT engine;
-            if constexpr (std::is_same_v<EngineT, hft::MatchingEngine> || std::is_same_v<EngineT, hft::FlatMatchingEngine>) {
-                if (pre_reserve) {
-                    engine.reserve(count);
-                }
+            if constexpr (std::is_same_v<EngineT, hft::MatchingEngine> ||
+                          std::is_same_v<EngineT, hft::FlatMatchingEngine>) {
+                if (pre_reserve) engine.reserve(count);
             }
-
             std::vector<hft::Trade> trades;
             trades.reserve(256);
 
-            auto t_start = Clock::now();
+            auto t_start = std::chrono::steady_clock::now();
             for (size_t i = 0; i < count; ++i) {
-                const auto& op = ops[i];
-                switch (op.type) {
-                    case OpType::SubmitLimit:
-                        engine.submit_limit_order(op.id, op.side, op.price, op.qty, trades);
-                        trades.clear();
-                        break;
-                    case OpType::Cancel:
-                        engine.cancel_order(op.id);
-                        break;
-                    case OpType::Modify:
-                        engine.modify_order(op.id, op.price, op.qty, trades);
-                        trades.clear();
-                        break;
-                }
+                run_op(engine, ops[i], trades);
             }
-            auto t_end = Clock::now();
-            std::chrono::duration<double> diff = t_end - t_start;
-            if (diff.count() < best_elapsed_sec) {
-                best_elapsed_sec = diff.count();
-                final_trades_count = engine.total_trades_generated();
+            auto t_end = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(t_end - t_start).count();
+            if (elapsed < best_elapsed_sec) {
+                best_elapsed_sec = elapsed;
+                final_trades = engine.total_trades_generated();
             }
         }
 
-        // 3. Latency Distribution Run
-        const size_t latency_samples = std::min(count, size_t{1000000});
-        std::vector<uint32_t> latencies_ns(latency_samples);
+        // ------------------------------------------------------------------
+        // 3. Per-operation latency: TSC-timed loop.
+        //    Warmup first to prime instruction cache and branch predictors.
+        //    Mean and all percentiles computed from the SAME sample array.
+        // ------------------------------------------------------------------
+        LatencySampler sampler(latency_samples);
 
         {
             EngineT engine;
-            if constexpr (std::is_same_v<EngineT, hft::MatchingEngine> || std::is_same_v<EngineT, hft::FlatMatchingEngine>) {
-                if (pre_reserve) {
-                    engine.reserve(count);
-                }
+            if constexpr (std::is_same_v<EngineT, hft::MatchingEngine> ||
+                          std::is_same_v<EngineT, hft::FlatMatchingEngine>) {
+                if (pre_reserve) engine.reserve(count);
             }
-
             std::vector<hft::Trade> trades;
             trades.reserve(128);
 
+            // Warmup: prime icache and branch predictors before recording samples.
+            for (size_t i = 0; i < warmup_count; ++i) {
+                run_op(engine, ops[i % count], trades);
+            }
+
+            // Instrumented latency loop.
             for (size_t i = 0; i < latency_samples; ++i) {
-                const auto& op = ops[i];
-                auto t0 = Clock::now();
-                switch (op.type) {
-                    case OpType::SubmitLimit:
-                        engine.submit_limit_order(op.id, op.side, op.price, op.qty, trades);
-                        trades.clear();
-                        break;
-                    case OpType::Cancel:
-                        engine.cancel_order(op.id);
-                        break;
-                    case OpType::Modify:
-                        engine.modify_order(op.id, op.price, op.qty, trades);
-                        trades.clear();
-                        break;
-                }
-                auto t1 = Clock::now();
-                latencies_ns[i] = static_cast<uint32_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+                auto t0 = timer.start();
+                run_op(engine, ops[i], trades);
+                sampler.record(timer.stop_ns(t0));
             }
         }
 
-        std::sort(latencies_ns.begin(), latencies_ns.end());
+        sampler.finish();
 
-        auto get_percentile = [&latencies_ns](double p) -> uint64_t {
-            size_t idx = static_cast<size_t>(p * static_cast<double>(latencies_ns.size() - 1));
-            return latencies_ns[idx];
-        };
+        const double alloc_sample_n = static_cast<double>(std::min(count - warmup_count, size_t{50000}));
 
         BenchmarkResult res;
-        res.engine_type = engine_type;
-        res.workload_name = name;
+        res.engine_type    = engine_type;
+        res.workload_name  = name;
         res.operation_count = count;
-        res.elapsed_seconds = best_elapsed_sec;
         res.throughput_mops = (static_cast<double>(count) / best_elapsed_sec) / 1e6;
-        res.p50_ns = get_percentile(0.50);
-        res.p95_ns = get_percentile(0.95);
-        res.p99_ns = get_percentile(0.99);
-        res.p999_ns = get_percentile(0.999);
-        res.max_ns = latencies_ns.back();
-        res.total_trades = final_trades_count;
-
-        const double sample_count = static_cast<double>(std::min(count, size_t{50000}));
-        res.allocs_per_op = static_cast<double>(alloc_res.alloc_count) / sample_count;
-        res.deallocs_per_op = static_cast<double>(alloc_res.dealloc_count) / sample_count;
-        res.bytes_per_op = static_cast<double>(alloc_res.bytes_allocated) / sample_count;
-
+        res.mean_ns        = sampler.mean_ns();
+        res.p50_ns         = sampler.p50_ns();
+        res.p95_ns         = sampler.p95_ns();
+        res.p99_ns         = sampler.p99_ns();
+        res.p999_ns        = sampler.p999_ns();
+        res.max_ns         = sampler.max_ns();
+        res.total_trades   = final_trades;
+        res.allocs_per_op  = (alloc_sample_n > 0)
+                                 ? static_cast<double>(alloc_res.alloc_count) / alloc_sample_n
+                                 : 0.0;
         return res;
     }
 };
 
 void print_comparison_row(const BenchmarkResult& map_res, const BenchmarkResult& flat_res) {
-    const double tput_gain = ((flat_res.throughput_mops - map_res.throughput_mops) / map_res.throughput_mops) * 100.0;
+    const double tput_gain = ((flat_res.throughput_mops - map_res.throughput_mops)
+                              / map_res.throughput_mops) * 100.0;
+
+    auto fmt_ns = [](double ns) {
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(0) << ns;
+        return oss.str();
+    };
 
     std::cout << std::left
               << std::setw(14) << map_res.workload_name
               << std::setw(9)  << map_res.operation_count
-              << std::setw(12) << (std::to_string(map_res.p50_ns) + " / " + std::to_string(flat_res.p50_ns))
-              << std::setw(12) << (std::to_string(map_res.p95_ns) + " / " + std::to_string(flat_res.p95_ns))
-              << std::setw(12) << (std::to_string(map_res.p99_ns) + " / " + std::to_string(flat_res.p99_ns))
-              << std::setw(13) << (std::to_string(map_res.p999_ns) + " / " + std::to_string(flat_res.p999_ns))
-              << std::setw(20) << (std::to_string(map_res.max_ns / 1000) + "us / " + std::to_string(flat_res.max_ns / 1000) + "us")
-              << std::setw(18) << (std::to_string(map_res.allocs_per_op).substr(0, 4) + " -> " + std::to_string(flat_res.allocs_per_op).substr(0, 4))
-              << std::fixed << std::setprecision(2) << map_res.throughput_mops << " -> " << flat_res.throughput_mops
-              << " (" << (tput_gain >= 0.0 ? "+" : "") << std::setprecision(1) << tput_gain << "%)\n";
+              << std::setw(14) << (fmt_ns(map_res.p50_ns)  + " / " + fmt_ns(flat_res.p50_ns))
+              << std::setw(14) << (fmt_ns(map_res.p95_ns)  + " / " + fmt_ns(flat_res.p95_ns))
+              << std::setw(14) << (fmt_ns(map_res.p99_ns)  + " / " + fmt_ns(flat_res.p99_ns))
+              << std::setw(14) << (fmt_ns(map_res.p999_ns) + " / " + fmt_ns(flat_res.p999_ns))
+              << std::setw(14) << (fmt_ns(map_res.mean_ns) + " / " + fmt_ns(flat_res.mean_ns))
+              << std::setw(18) << (std::to_string(map_res.allocs_per_op).substr(0,4) +
+                                   " -> " + std::to_string(flat_res.allocs_per_op).substr(0,4))
+              << std::fixed << std::setprecision(2)
+              << map_res.throughput_mops << " -> " << flat_res.throughput_mops
+              << " (" << (tput_gain >= 0.0 ? "+" : "")
+              << std::setprecision(1) << tput_gain << "%)\n";
 }
 
 int main(int argc, char* argv[]) {
     const uint64_t seed = 0x12345678ULL;
     WorkloadGenerator generator(seed);
 
-    const double timer_overhead = BenchmarkRunner::measure_timer_overhead_ns();
+    // Calibrate TSC timer at startup (3 x 50 ms sleep against steady_clock).
+    BenchTimer timer;
+    timer.calibrate(3, 50);
 
     std::cout << "=======================================================================================================================\n";
-    std::cout << " LOW-LATENCY C++ EXCHANGE ENGINE: PHASE 4 PRICE-LEVEL BENCHMARK\n";
-    std::cout << " Comparing: MapMatchingEngine (std::map) vs FlatMatchingEngine (Contiguous Sorted Vector)\n";
+    std::cout << " LOW-LATENCY C++ EXCHANGE ENGINE — ORDER BOOK BENCHMARK\n";
+    std::cout << " Comparing: MatchingEngine (std::map) vs FlatMatchingEngine (Contiguous Sorted Vector)\n";
     std::cout << "=======================================================================================================================\n\n";
 
-    std::cout << "Environment:\n";
-    std::cout << "  Platform         : Windows x64\n";
-    std::cout << "  Compiler         : MSVC 19.50 (C++20 Release /O2)\n";
-    std::cout << "  Timer            : std::chrono::steady_clock (QPC overhead: " << std::fixed << std::setprecision(1) << timer_overhead << " ns)\n";
-    std::cout << "  Deterministic Seed: 0x" << std::hex << seed << std::dec << "\n\n";
+    std::cout << "Timer: TSC (empirical calibration) — " << std::fixed << std::setprecision(3)
+              << timer.tsc_ghz() << " GHz\n";
+    std::cout << "Note:  Throughput = total_ops / wall_clock_seconds (uninstrumented bulk loop)\n";
+    std::cout << "       Latency    = per-op TSC samples; mean/p50/p95/p99/max from the SAME sample array\n\n";
 
     bool run_10m = false;
     for (int i = 1; i < argc; ++i) {
@@ -459,87 +456,71 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    std::vector<size_t> sizes = {10000, 100000, 1000000};
-
+    const std::vector<size_t> sizes = {10000, 100000, 1000000};
     std::vector<std::pair<BenchmarkResult, BenchmarkResult>> comparisons;
 
     for (size_t count : sizes) {
         std::cout << ">>> BENCHMARKING SCALE: " << count << " OPERATIONS <<<\n";
 
-        // ADD-HEAVY
         generator.reset(seed + 1);
         auto add_ops = generator.generate_add_heavy(count);
-        auto m_add = BenchmarkRunner::run<hft::MatchingEngine>("Map", "ADD-HEAVY", add_ops, true);
-        auto f_add = BenchmarkRunner::run<hft::FlatMatchingEngine>("Flat", "ADD-HEAVY", add_ops, true);
+        auto m_add   = BenchmarkRunner::run<hft::MatchingEngine>(timer, "Map",  "ADD-HEAVY",    add_ops, true);
+        auto f_add   = BenchmarkRunner::run<hft::FlatMatchingEngine>(timer, "Flat", "ADD-HEAVY", add_ops, true);
         comparisons.push_back({m_add, f_add});
-        std::cout << "  [ADD-HEAVY]   Map: " << std::fixed << std::setprecision(2) << m_add.throughput_mops
-                  << " M/s (" << m_add.allocs_per_op << " allocs/op)  -->  Flat: "
-                  << f_add.throughput_mops << " M/s (" << f_add.allocs_per_op << " allocs/op)\n";
 
-        // MATCH-HEAVY
         generator.reset(seed + 2);
         auto match_ops = generator.generate_match_heavy(count);
-        auto m_match = BenchmarkRunner::run<hft::MatchingEngine>("Map", "MATCH-HEAVY", match_ops, true);
-        auto f_match = BenchmarkRunner::run<hft::FlatMatchingEngine>("Flat", "MATCH-HEAVY", match_ops, true);
+        auto m_match   = BenchmarkRunner::run<hft::MatchingEngine>(timer, "Map",  "MATCH-HEAVY",    match_ops, true);
+        auto f_match   = BenchmarkRunner::run<hft::FlatMatchingEngine>(timer, "Flat", "MATCH-HEAVY", match_ops, true);
         comparisons.push_back({m_match, f_match});
-        std::cout << "  [MATCH-HEAVY] Map: " << std::fixed << std::setprecision(2) << m_match.throughput_mops
-                  << " M/s (" << m_match.allocs_per_op << " allocs/op)  -->  Flat: "
-                  << f_match.throughput_mops << " M/s (" << f_match.allocs_per_op << " allocs/op)\n";
 
-        // CANCEL-HEAVY
         generator.reset(seed + 3);
         auto cancel_ops = generator.generate_cancel_heavy(count);
-        auto m_cancel = BenchmarkRunner::run<hft::MatchingEngine>("Map", "CANCEL-HEAVY", cancel_ops, true);
-        auto f_cancel = BenchmarkRunner::run<hft::FlatMatchingEngine>("Flat", "CANCEL-HEAVY", cancel_ops, true);
+        auto m_cancel   = BenchmarkRunner::run<hft::MatchingEngine>(timer, "Map",  "CANCEL-HEAVY",    cancel_ops, true);
+        auto f_cancel   = BenchmarkRunner::run<hft::FlatMatchingEngine>(timer, "Flat", "CANCEL-HEAVY", cancel_ops, true);
         comparisons.push_back({m_cancel, f_cancel});
-        std::cout << "  [CANCEL-HEAVY]Map: " << std::fixed << std::setprecision(2) << m_cancel.throughput_mops
-                  << " M/s (" << m_cancel.allocs_per_op << " allocs/op)  -->  Flat: "
-                  << f_cancel.throughput_mops << " M/s (" << f_cancel.allocs_per_op << " allocs/op)\n";
 
-        // MIXED
         generator.reset(seed + 4);
         auto mixed_ops = generator.generate_mixed(count);
-        auto m_mixed = BenchmarkRunner::run<hft::MatchingEngine>("Map", "MIXED", mixed_ops, true);
-        auto f_mixed = BenchmarkRunner::run<hft::FlatMatchingEngine>("Flat", "MIXED", mixed_ops, true);
+        auto m_mixed   = BenchmarkRunner::run<hft::MatchingEngine>(timer, "Map",  "MIXED",    mixed_ops, true);
+        auto f_mixed   = BenchmarkRunner::run<hft::FlatMatchingEngine>(timer, "Flat", "MIXED", mixed_ops, true);
         comparisons.push_back({m_mixed, f_mixed});
-        std::cout << "  [MIXED]       Map: " << std::fixed << std::setprecision(2) << m_mixed.throughput_mops
-                  << " M/s (" << m_mixed.allocs_per_op << " allocs/op)  -->  Flat: "
-                  << f_mixed.throughput_mops << " M/s (" << f_mixed.allocs_per_op << " allocs/op)\n\n";
+
+        std::cout << "\n";
     }
 
     if (run_10m) {
-        std::cout << ">>> BENCHMARKING 10M LARGE WORKLOAD (STRESS TEST) <<<\n";
         const size_t count = 10000000;
+        std::cout << ">>> BENCHMARKING 10M LARGE WORKLOAD <<<\n";
         generator.reset(seed + 10);
         auto mixed_10m = generator.generate_mixed(count);
-        auto m_10m = BenchmarkRunner::run<hft::MatchingEngine>("Map", "MIXED-10M", mixed_10m, true);
-        auto f_10m = BenchmarkRunner::run<hft::FlatMatchingEngine>("Flat", "MIXED-10M", mixed_10m, true);
+        auto m_10m = BenchmarkRunner::run<hft::MatchingEngine>(timer, "Map",  "MIXED-10M",    mixed_10m, true);
+        auto f_10m = BenchmarkRunner::run<hft::FlatMatchingEngine>(timer, "Flat", "MIXED-10M", mixed_10m, true);
         comparisons.push_back({m_10m, f_10m});
-        std::cout << "  [MIXED-10M]   Map: " << std::fixed << std::setprecision(2) << m_10m.throughput_mops
-                  << " M/s (" << m_10m.allocs_per_op << " allocs/op)  -->  Flat: "
-                  << f_10m.throughput_mops << " M/s (" << f_10m.allocs_per_op << " allocs/op)\n\n";
+        std::cout << "\n";
     }
 
-    std::cout << "\n====================================================================================================================================================\n";
-    std::cout << " PHASE 4 COMPARISON: MAP (std::map) vs FLAT (Contiguous Sorted Vector)\n";
-    std::cout << " Format: [Map] / [Flat]\n";
-    std::cout << "====================================================================================================================================================\n";
+    // Summary table
+    std::cout << "\n=================================================================================================================================\n";
+    std::cout << " COMPARISON: Map (std::map) vs Flat (Contiguous Sorted Vector) — Format: [Map] / [Flat]\n";
+    std::cout << " All latency columns derived from the same TSC sample array\n";
+    std::cout << "=================================================================================================================================\n";
     std::cout << std::left
               << std::setw(14) << "Workload"
               << std::setw(9)  << "Size"
-              << std::setw(12) << "p50 (ns)"
-              << std::setw(12) << "p95 (ns)"
-              << std::setw(12) << "p99 (ns)"
-              << std::setw(13) << "p99.9 (ns)"
-              << std::setw(20) << "Max Latency"
+              << std::setw(14) << "p50 (ns)"
+              << std::setw(14) << "p95 (ns)"
+              << std::setw(14) << "p99 (ns)"
+              << std::setw(14) << "p99.9 (ns)"
+              << std::setw(14) << "Mean (ns)"
               << std::setw(18) << "Allocs/Op"
               << "Throughput (M ops/s)\n";
-    std::cout << "----------------------------------------------------------------------------------------------------------------------------------------------------\n";
+    std::cout << "---------------------------------------------------------------------------------------------------------------------------------\n";
 
     for (const auto& [map_res, flat_res] : comparisons) {
         print_comparison_row(map_res, flat_res);
     }
-    std::cout << "====================================================================================================================================================\n";
+    std::cout << "=================================================================================================================================\n";
 
     return 0;
 }
