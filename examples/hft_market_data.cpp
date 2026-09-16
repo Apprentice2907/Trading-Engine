@@ -203,6 +203,7 @@ int cmd_record(const std::string& path, bool mock_mode, size_t target_count) {
             }
         }
     } else {
+#ifdef _WIN32
         auto config = hft::broker::AngelClient::load_config_from_env();
         if (config.api_key.empty() || config.client_code.empty() || config.feed_token.empty()) {
             std::cerr << "Error: Angel One credentials missing in environment.\n";
@@ -234,6 +235,12 @@ int cmd_record(const std::string& path, bool mock_mode, size_t target_count) {
         client.stop();
         if (net_thread.joinable()) net_thread.join();
         client.disconnect();
+#else
+        (void)target_count;
+        std::cerr << "\n[Notice] Angel One live WebSocket provider is only available on Windows (WinHTTP).\n";
+        std::cerr << "Run with '--mock' to record synthetic market data offline on Linux.\n";
+        return 1;
+#endif
     }
 
     pipeline.stop_and_join();
