@@ -1,0 +1,39 @@
+name: Decoder Mutation Fuzzing
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fuzz.yml'
+  workflow_dispatch:
+
+jobs:
+  libfuzzer:
+    name: Clang libFuzzer (600s Mutation Campaign)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Clang
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang
+
+      - name: Build fuzz target with Clang + libFuzzer + ASan + UBSan
+        run: |
+          clang++ --version
+          clang++ -std=c++20 -O2 -g \
+            -fsanitize=fuzzer,address,undefined \
+            -fno-omit-frame-pointer \
+            -Iinclude \
+            tests/fuzz_decoder.cpp \
+            src/market_data.cpp \
+            -o fuzz_decoder
+
+      - name: Verify libFuzzer target type and arguments
+        run: |
+          ./fuzz_decoder -help=1 || true
+
+      - name: Run genuine libFuzzer mutation campaign (600s)
+        run: |
+          ./fuzz_decoder -max_total_time=600 -print_final_stats=1 tests/corpus/
