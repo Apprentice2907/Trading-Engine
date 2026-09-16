@@ -1,0 +1,15 @@
+{
+  "chart": {
+    "result": [{
+      "meta": {
+        "currency": "USD",
+        "symbol": "SPY",
+        "exchangeName": "PCX",
+        "regularMarketTime": 1710002000,
+        "regularMarketPrice": 510.25,
+        "regularMarketVolume": 70000000
+      }
+    }],
+    "error": null
+  }
+}

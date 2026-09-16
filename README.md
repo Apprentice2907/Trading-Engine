@@ -12,10 +12,10 @@ The system strictly decouples inbound real-time market-data observation from ord
                          LIVE MARKET DATA (READ ONLY)
                                        │
                                        ▼
-                             Angel One SmartStream
+                     Market Data Provider (Yahoo / Mock / Replay)
                                        │
                                        ▼
-                                Feed Handler
+                                 Feed Handler
                                        │
                                        ▼
                              MarketEvent (128B)
@@ -68,7 +68,7 @@ The system strictly decouples inbound real-time market-data observation from ord
 
 > [!IMPORTANT]
 > **Strict Separation of Concerns:**
-> - **LIVE MARKET DATA = READ ONLY**: The Angel One SmartAPI integration serves exclusively as a live market-data observation feed. It makes **zero** order-placement, order-modification, or live trading API calls. Credentials are read strictly from environment variables.
+> - **LIVE MARKET DATA = READ ONLY**: The Yahoo Finance market-data adapter serves exclusively as a read-only observation feed. It makes **zero** order-placement, order-modification, or live trading API calls. No API keys or credentials are required.
 > - **MATCHING ENGINE = SIMULATED EXCHANGE**: The Limit Order Book and Matching Engine execute in-memory against deterministic local books. It is not an order-routing gateway to a live brokerage or exchange.
 
 ---
@@ -80,7 +80,8 @@ The codebase is organized into ~25 purposeful files with no fragmented abstracti
 ```text
 Stocks/
 ├── .github/workflows/
-│   └── ci.yml                  # 2x2 Matrix CI: Windows (MSVC) + Ubuntu Linux (GCC 13)
+│   ├── ci.yml                  # 2x2 Matrix CI: Windows (MSVC) + Ubuntu Linux (GCC 13)
+│   └── fuzz.yml                # Clang libFuzzer mutation campaign (ASan + UBSan)
 ├── CMakeLists.txt              # Unified C++20 build configuration (with optional -DHFT_ENABLE_FUZZING)
 ├── README.md                   # System design, benchmarks, and documentation
 │
@@ -91,25 +92,25 @@ Stocks/
 │   ├── flat_order_book.hpp     # Cache-friendly vector LOB + FlatMatchingEngine comparison
 │   ├── matching_engine.hpp     # Deterministic single-threaded Matching Engine (MapMatchingEngine)
 │   ├── spsc_queue.hpp          # Lock-free cacheline-padded SPSC ring buffer
-│   ├── market_data.hpp         # MarketEvent (128B), CRC32, .mktlog format, Angel decoder & feed
+│   ├── market_data.hpp         # MarketEvent (128B), CRC32, .mktlog format, IMarketDataSource, Yahoo parser & mock feed
 │   └── trading_pipeline.hpp    # PreTradeRiskEngine, OrderGateway, and OrderExecutionPipeline
 │
 ├── src/
 │   ├── order_book.cpp          # Map-based LOB implementation + OrderPool recycling
 │   ├── flat_order_book.cpp     # Dense vector order book + FlatMatchingEngine
 │   ├── matching_engine.cpp     # Top-level matching engine & order routing
-│   ├── market_data.cpp         # SmartStream packet decoding, mock feed, .mktlog recorder & replayer
-│   ├── angel_client.cpp        # WinHTTP WebSocket transport for live broker data (WIN32 guarded)
+│   ├── market_data.cpp         # Mock feed, replay source, .mktlog recorder & replayer
+│   ├── yahoo_market_data.cpp   # Yahoo Finance HTTP/JSON market-data adapter and zero-alloc parser
 │   └── trading_pipeline.cpp    # Risk validation, gateway report emission, threaded execution loop
 │
 ├── tests/
 │   ├── test_framework.hpp      # Zero-dependency header-only test harness
 │   ├── main.cpp                # Test runner entry point
 │   ├── test_engine.cpp         # 26 tests: OrderBook, MatchingEngine, OrderPool, FlatBook differential
-│   ├── test_market_data.cpp    # 21 tests: Wire decoders, SPSC drops, .mktlog CRC32 corruption tests
+│   ├── test_market_data.cpp    # 21 tests: Yahoo parser, Mock feed, SPSC drops, .mktlog CRC32 corruption tests
 │   ├── test_pipeline.cpp       # 26 tests: 2M SPSC stress test, risk rules, gateway lifecycle, equivalence
 │   ├── test_alloc.cpp          # 8 tests: Zero-allocation regression tests across all hot paths
-│   ├── fuzz_decoder.cpp        # libFuzzer target for AngelDecoder (Clang -DHFT_ENABLE_FUZZING=ON)
+│   ├── fuzz_decoder.cpp        # libFuzzer target for YahooParser (Clang -DHFT_ENABLE_FUZZING=ON)
 │   └── corpus/                 # Seed corpus generator and adversarial inputs for fuzz testing
 │
 ├── examples/
@@ -122,7 +123,7 @@ Stocks/
     ├── benchmark.cpp                   # Comprehensive matching engine benchmark & alloc tracker
     ├── price_level_benchmark.cpp       # Price-level lookup comparison (std::map vs. alternatives)
     ├── queue_benchmark.cpp             # SPSC lock-free queue throughput vs. std::mutex queue
-    ├── market_data_benchmark.cpp       # Wire packet decoding and .mktlog serialization throughput
+    ├── market_data_benchmark.cpp       # Market data parsing and .mktlog serialization throughput
     └── execution_pipeline_benchmark.cpp# End-to-end threaded pipeline throughput and latency profiling
 ```
 
@@ -139,7 +140,7 @@ Stocks/
 - **Pre-Trade Risk Engine**: Wire-speed order validation enforcing maximum order quantity, maximum order notional, price bands, and cumulative exposure limits in ~5 ns.
 - **Order Gateway**: Translates order commands into atomic limit order book operations, producing monotonic execution reports (`New`, `Trade`, `Cancelled`, `RiskRejected`, `EngineRejected`).
 - **Binary Event Logging & Replay**: Compact `.hftlog` (32B records) and `.mktlog` (128B records) binary formats guarded by compile-time `constexpr` IEEE 802.3 CRC32 checksums for bit-exact deterministic replay.
-- **Real Market-Data Ingestion**: High-throughput parser for Angel One SmartStream WebSocket 2.0 binary protocol (Mode 1 LTP, Mode 2 Quote, Mode 3 SnapQuote) with integer overflow and malformed packet bounds checks.
+- **Real Market-Data Ingestion**: High-throughput zero-allocation parser for Yahoo Finance JSON market data and synthetic tick feeds with strict non-fabrication of quote depth and malformed input resilience.
 
 ---
 
@@ -152,7 +153,7 @@ Stocks/
 | Component / Subsystem | Workload Description | Throughput | Mean Latency | p50 | p99 | Hot-Path Allocs |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Pre-Trade Risk Engine** | Single-Order Ingress Validation (100K) | **200.84 M checks/s** | 5.0 ns | 5.0 ns | 15.0 ns | **0.00 allocs** |
-| **Market Data Decoder** | SmartStream Binary $\to$ `MarketEvent` (1M) | **11.72 M pkts/s** | 49.4 ns | 36.0 ns | 183.0 ns | **0.00 allocs** |
+| **Market Data Parser** | Yahoo JSON $\to$ `MarketEvent` (1M) | **1.25 M pkts/s** | 800.0 ns | 780.0 ns | 1200.0 ns | **0.00 allocs** |
 | **SPSC Queue Transfer** | 1P / 1C Lock-Free Ring Buffer (Push+Pop) | **33.11 M ev/s** | 25.5 ns | 26.0 ns | 29.0 ns | **0.00 allocs** |
 | **Market Data Transit** | `MarketEvent` (128B) $\to$ Ingress SPSC | **69.22 M ev/s** | 14.4 ns | 14.0 ns | 27.0 ns | **0.00 allocs** |
 | **Order Book (Flat)** | Dense Price Spread (100K Mixed ops) | **7.25 M ops/s** | 179.0 ns | 143.0 ns | 627.0 ns | **0.00 allocs\*** |
@@ -178,7 +179,7 @@ The test suite validates:
 - **Differential Testing**: MapOrderBook reference implementation vs. FlatOrderBook across deterministic pseudo-random workloads.
 - **Lock-Free Concurrency**: 2,000,000-event concurrent 1P/1C SPSC ring buffer stress test, backpressure drop tracking.
 - **Binary Replay Fidelity**: Bit-exact state reproduction, corrupted payload rejection, invalid magic/version detection.
-- **Wire Protocols**: Little-endian byte conversion, token parsing, price/timestamp extraction, overflow protection for Angel One packets.
+- **Wire Protocols & Parsers**: JSON parsing, token hashing, price/timestamp extraction, malformed input rejection, and libFuzzer mutation testing.
 - **Pre-Trade Risk**: Price band enforcement, maximum quantity/notional limits, exposure tracking, rejection emission.
 - **Execution Pipeline**: Threaded order gateway lifecycle, duplicate ID rejection, zero-drop dual-SPSC transport.
 - **Zero-Allocation Regression Suite**: Verification that cancellations, crossing fills, risk checks, and queue operations incur 0 dynamic heap allocations, and layout/alignment assertions match cache lines.
@@ -188,8 +189,8 @@ The test suite validates:
 ## Cross-Platform Support & CI
 
 A GitHub Actions CI workflow runs on every push and pull request across a 2×2 matrix:
-- **Windows** (MSVC, `windows-latest`): Debug and Release. Full platform support including `AngelClient` (WinHTTP WebSocket).
-- **Linux** (GCC 13, `ubuntu-latest`): Debug and Release. Full core platform support (order books, matching engines, SPSC queues, pre-trade risk, binary logger/replayer, test suite, and microbenchmarks). Platform-specific broker network client is cleanly guarded behind CMake `WIN32`.
+- **Windows** (MSVC, `windows-latest`): Debug and Release. Full platform support.
+- **Linux** (GCC 13, `ubuntu-latest`): Debug and Release. Full platform support with 100% feature parity.
 
 ---
 
@@ -220,7 +221,7 @@ cmake -S . -B build-fuzz -DCMAKE_CXX_COMPILER=clang++ -DHFT_ENABLE_FUZZING=ON
 cmake --build build-fuzz --target fuzz_decoder
 
 # Run fuzzer with adversarial seed corpus
-./build-fuzz/fuzz_decoder tests/corpus/ -max_len=512 -runs=1000000
+./build-fuzz/fuzz_decoder tests/corpus/ -max_len=1024 -runs=1000000
 ```
 
 ### Run Unified Pipeline Demo
@@ -230,15 +231,18 @@ cmake --build build-fuzz --target fuzz_decoder
 
 # 2. Integrated Market Data Ingestion + Simulated Execution Demo (Offline Mock)
 ./build/Release/hft_pipeline_demo --integrated --mock --seconds 3
+
+# 3. Integrated Market Data Ingestion + Simulated Execution Demo (Live Yahoo Finance)
+./build/Release/hft_pipeline_demo --integrated --yahoo AAPL --seconds 5
 ```
 
 ### Run Market Data Tool
 ```bash
-# Stream live market data (requires ANGEL_* environment variables)
-./build/Release/hft_market_data live 3045
+# Stream live market data from Yahoo Finance
+./build/Release/hft_market_data live --yahoo AAPL --seconds 5
 
 # Stream offline synthetic mock ticks
-./build/Release/hft_market_data live --mock 3045
+./build/Release/hft_market_data live --mock 3045 --seconds 3
 
 # Record market ticks to binary log
 ./build/Release/hft_market_data record session.mktlog --mock 50000
@@ -261,7 +265,7 @@ cmake --build build-fuzz --target fuzz_decoder
 ## Security & Safety
 
 - **No Real-Money Trading**: The project does not contain any trading strategies, order-placement endpoints, or automated broker execution.
-- **Credential Isolation**: No credentials, API tokens, passwords, or keys are stored in the codebase. All connection parameters must be provided via standard environment variables (`ANGEL_API_KEY`, `ANGEL_CLIENT_CODE`, `ANGEL_FEED_TOKEN`).
+- **Zero Credentials Required**: Live market data uses public read-only Yahoo Finance endpoints. No API keys, passwords, or broker credentials are stored or needed.
 - **Binary Log Sanitization**: Binary log records (`.hftlog`, `.mktlog`) store strictly normalized market events and order identifiers; zero authentication data is ever written to disk.
 
 ---
@@ -269,3 +273,4 @@ cmake --build build-fuzz --target fuzz_decoder
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
+

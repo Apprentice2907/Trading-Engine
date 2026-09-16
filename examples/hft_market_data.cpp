@@ -1,3 +1,5 @@
+#define _CRT_SECURE_NO_WARNINGS
+
 #include "hft/market_data.hpp"
 
 #include <iostream>
@@ -18,15 +20,15 @@ void signal_handler(int) {
 }
 
 void print_usage(const char* prog) {
-    std::cout << "HFT Angel One SmartAPI Market Data Tool\n";
+    std::cout << "HFT Market Data Tool\n";
     std::cout << "Usage:\n";
-    std::cout << "  " << prog << " live [--mock] [--seconds N] [token]     Stream live or mock market data\n";
-    std::cout << "  " << prog << " record <output.mktlog> [--mock] [count] Record market data to binary log\n";
-    std::cout << "  " << prog << " replay <input.mktlog>                  Replay recorded market data offline\n";
+    std::cout << "  " << prog << " live [--mock] [--yahoo SYMBOL] [--seconds N]     Stream live or mock market data\n";
+    std::cout << "  " << prog << " record <output.mktlog> [--mock] [--yahoo SYMBOL] [count] Record market data to binary log\n";
+    std::cout << "  " << prog << " replay <input.mktlog>                                  Replay recorded market data offline\n";
 }
 
-int cmd_live(bool mock_mode, uint32_t token, uint32_t duration_sec = 0) {
-    std::cout << "Starting market data stream (" << (mock_mode ? "MOCK FEED" : "LIVE ANGEL ONE") << ")...\n";
+int cmd_live(bool mock_mode, const std::string& yahoo_symbol, uint32_t duration_sec = 0) {
+    std::cout << "Starting market data stream (" << (mock_mode ? "MOCK FEED" : ("YAHOO FINANCE: " + yahoo_symbol)) << ")...\n";
     if (duration_sec > 0) {
         std::cout << "Running for controlled duration: " << duration_sec << " seconds...\n";
     }
@@ -35,33 +37,25 @@ int cmd_live(bool mock_mode, uint32_t token, uint32_t duration_sec = 0) {
     pipeline.start();
 
     std::signal(SIGINT, signal_handler);
-
     auto stream_start = std::chrono::steady_clock::now();
 
     if (mock_mode) {
-        std::cout << "Streaming deterministic mock ticks for token " << token << " (Ctrl+C to stop)...\n";
-        auto packets = hft::broker::MockAngelFeed::generate_synthetic_stream(1000000);
+        std::cout << "Streaming deterministic mock ticks (Ctrl+C to stop)...\n";
+        auto events = hft::MockMarketDataSource::generate_events(1000000, 3045);
         size_t idx = 0;
 
         auto last_report = std::chrono::steady_clock::now();
         uint64_t last_consumed = 0;
 
-        while (!g_shutdown.load() && idx < packets.size()) {
+        while (!g_shutdown.load() && idx < events.size()) {
             if (duration_sec > 0) {
                 auto curr = std::chrono::steady_clock::now();
                 if (std::chrono::duration<double>(curr - stream_start).count() >= duration_sec) {
                     break;
                 }
             }
-            hft::MarketEvent ev{};
-            uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
 
-            if (hft::broker::AngelDecoder::decode(packets[idx].data(), packets[idx].size(), ev, now_ns)) {
-                pipeline.enqueue_event(ev);
-            }
-            ++idx;
-
+            pipeline.enqueue_event(events[idx++]);
             std::this_thread::sleep_for(std::chrono::microseconds(100));
 
             auto now = std::chrono::steady_clock::now();
@@ -77,7 +71,7 @@ int cmd_live(bool mock_mode, uint32_t token, uint32_t duration_sec = 0) {
                     std::cout << "\r[FEED] Token: " << latest->instrument_token
                               << " | Events: " << current_consumed
                               << " (" << rate << " ev/s) | Drops: " << pipeline.total_dropped()
-                              << " | LTP: " << std::fixed << std::setprecision(2) << (latest->last_price / 100.0)
+                              << " | Last: " << std::fixed << std::setprecision(2) << (latest->last_price / 100.0)
                               << " | Bid: " << (latest->best_bid_price / 100.0)
                               << " | Ask: " << (latest->best_ask_price / 100.0) << std::flush;
                 }
@@ -85,96 +79,60 @@ int cmd_live(bool mock_mode, uint32_t token, uint32_t duration_sec = 0) {
         }
         std::cout << "\n";
     } else {
-#ifdef _WIN32
-        auto config = hft::broker::AngelClient::load_config_from_env();
-        if (token != 0) config.instrument_token = token;
+        hft::YahooConfig config;
+        config.symbols = {yahoo_symbol};
+        config.poll_interval_ms = 1000;
 
-        if (config.api_key.empty() || config.client_code.empty() || config.feed_token.empty()) {
-            std::cerr << "\n[Error] Angel One credentials missing in environment!\n";
-            std::cerr << "Required variables:\n";
-            std::cerr << "  ANGEL_API_KEY       (e.g. your SmartAPI key)\n";
-            std::cerr << "  ANGEL_CLIENT_CODE   (e.g. your client code)\n";
-            std::cerr << "  ANGEL_FEED_TOKEN    (e.g. your active feed token)\n";
-            std::cerr << "Optional variables:\n";
-            std::cerr << "  ANGEL_JWT_TOKEN     (if session already logged in)\n\n";
-            std::cerr << "Tip: You can test the full pipeline offline using: " << "live --mock\n";
+        hft::YahooMarketDataSource source(config);
+        source.attach_pipeline(&pipeline);
+
+        std::cout << "Polling Yahoo Finance development feed for " << yahoo_symbol << " (best-effort, non-exchange-grade)...\n";
+        if (!source.start()) {
+            std::cerr << "Failed to start Yahoo market data source.\n";
             return 1;
         }
-
-        hft::broker::AngelClient client(config);
-        client.set_packet_callback([&pipeline](const uint8_t* data, size_t len) {
-            hft::MarketEvent ev{};
-            uint64_t recv_ts = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-            if (hft::broker::AngelDecoder::decode(data, len, ev, recv_ts)) {
-                pipeline.enqueue_event(ev);
-            }
-        });
-
-        if (!client.connect()) {
-            std::cerr << "Failed to connect to Angel One SmartStream.\n";
-            return 1;
-        }
-
-        std::cout << "Connected to Angel One SmartStream. Subscribing to token " << config.instrument_token << "...\n";
-        client.subscribe(config.instrument_token, hft::broker::AngelConstants::MODE_QUOTE);
-
-        // Run network receive loop in background thread
-        std::thread net_thread([&client]() {
-            client.run_receive_loop();
-        });
 
         auto last_report = std::chrono::steady_clock::now();
         uint64_t last_consumed = 0;
 
-        while (!g_shutdown.load() && client.is_connected()) {
+        while (!g_shutdown.load() && source.running()) {
             if (duration_sec > 0) {
                 auto curr = std::chrono::steady_clock::now();
                 if (std::chrono::duration<double>(curr - stream_start).count() >= duration_sec) {
                     break;
                 }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
             auto now = std::chrono::steady_clock::now();
             double elapsed = std::chrono::duration<double>(now - last_report).count();
             if (elapsed >= 1.0) {
                 uint64_t current_consumed = pipeline.total_consumed();
-                uint64_t rate = static_cast<uint64_t>((current_consumed - last_consumed) / elapsed);
                 last_consumed = current_consumed;
                 last_report = now;
 
                 auto latest = pipeline.latest_event();
                 if (latest) {
-                    std::cout << "\r[ANGEL] Token: " << latest->instrument_token
+                    const char* sym = reinterpret_cast<const char*>(latest->reserved);
+                    std::cout << "\r[YAHOO] Symbol: " << (sym[0] ? sym : yahoo_symbol.c_str())
+                              << " | Price: " << std::fixed << std::setprecision(2) << (latest->last_price / 100.0)
+                              << " | Volume: " << latest->volume
                               << " | Events: " << current_consumed
-                              << " (" << rate << " ev/s) | Drops: " << pipeline.total_dropped()
-                              << " | LTP: " << std::fixed << std::setprecision(2) << (latest->last_price / 100.0)
-                              << " | Bid: " << (latest->best_bid_price / 100.0)
-                              << " | Ask: " << (latest->best_ask_price / 100.0) << std::flush;
+                              << " | Drops: " << pipeline.total_dropped() << std::flush;
                 }
             }
         }
 
-        client.stop();
-        if (net_thread.joinable()) net_thread.join();
-        client.disconnect();
-        std::cout << "\nDisconnected.\n";
-#else
-        (void)token;
-        (void)duration_sec;
-        (void)stream_start;
-        std::cerr << "\n[Notice] Angel One live WebSocket provider is only available on Windows (WinHTTP).\n";
-        std::cerr << "Run with '--mock' to stream or record market data offline on Linux.\n";
-        return 1;
-#endif
+        source.stop();
+        std::cout << "\nDisconnected from Yahoo feed.\n";
     }
 
     pipeline.stop_and_join();
     return 0;
 }
 
-int cmd_record(const std::string& path, bool mock_mode, size_t target_count) {
-    std::cout << "Recording market data to " << path << " (" << (mock_mode ? "MOCK FEED" : "LIVE ANGEL ONE") << ")...\n";
+int cmd_record(const std::string& path, bool mock_mode, const std::string& yahoo_symbol, size_t target_count) {
+    std::cout << "Recording market data to " << path << " (" << (mock_mode ? "MOCK FEED" : ("YAHOO FEED: " + yahoo_symbol)) << ")...\n";
 
     hft::MarketEventRecorder recorder;
     if (!recorder.open(path)) {
@@ -189,58 +147,26 @@ int cmd_record(const std::string& path, bool mock_mode, size_t target_count) {
     pipeline.start();
 
     std::signal(SIGINT, signal_handler);
-
     auto start_time = std::chrono::steady_clock::now();
 
     if (mock_mode) {
-        auto packets = hft::broker::MockAngelFeed::generate_synthetic_stream(target_count);
-        for (size_t i = 0; i < packets.size() && !g_shutdown.load(); ++i) {
-            hft::MarketEvent ev{};
-            uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-            if (hft::broker::AngelDecoder::decode(packets[i].data(), packets[i].size(), ev, now_ns)) {
-                pipeline.enqueue_event_wait(ev);
-            }
+        auto events = hft::MockMarketDataSource::generate_events(target_count, 3045);
+        for (size_t i = 0; i < events.size() && !g_shutdown.load(); ++i) {
+            pipeline.enqueue_event_wait(events[i]);
         }
     } else {
-#ifdef _WIN32
-        auto config = hft::broker::AngelClient::load_config_from_env();
-        if (config.api_key.empty() || config.client_code.empty() || config.feed_token.empty()) {
-            std::cerr << "Error: Angel One credentials missing in environment.\n";
-            return 1;
-        }
+        hft::YahooConfig config;
+        config.symbols = {yahoo_symbol};
+        config.poll_interval_ms = 500;
 
-        hft::broker::AngelClient client(config);
-        client.set_packet_callback([&pipeline](const uint8_t* data, size_t len) {
-            hft::MarketEvent ev{};
-            uint64_t recv_ts = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-            if (hft::broker::AngelDecoder::decode(data, len, ev, recv_ts)) {
-                pipeline.enqueue_event(ev);
-            }
-        });
-
-        if (!client.connect()) {
-            std::cerr << "Failed to connect to Angel One.\n";
-            return 1;
-        }
-
-        client.subscribe(config.instrument_token, hft::broker::AngelConstants::MODE_QUOTE);
-        std::thread net_thread([&client]() { client.run_receive_loop(); });
+        hft::YahooMarketDataSource source(config);
+        source.attach_pipeline(&pipeline);
+        source.start();
 
         while (!g_shutdown.load() && pipeline.total_consumed() < target_count) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-
-        client.stop();
-        if (net_thread.joinable()) net_thread.join();
-        client.disconnect();
-#else
-        (void)target_count;
-        std::cerr << "\n[Notice] Angel One live WebSocket provider is only available on Windows (WinHTTP).\n";
-        std::cerr << "Run with '--mock' to record synthetic market data offline on Linux.\n";
-        return 1;
-#endif
+        source.stop();
     }
 
     pipeline.stop_and_join();
@@ -255,7 +181,9 @@ int cmd_record(const std::string& path, bool mock_mode, size_t target_count) {
     std::cout << "  Events written:  " << recorder.events_written() << "\n";
     std::cout << "  File size:       " << file_size << " bytes (" << (file_size / (1024.0 * 1024.0)) << " MB)\n";
     std::cout << "  Duration:        " << (sec * 1000.0) << " ms\n";
-    std::cout << "  Throughput:      " << static_cast<uint64_t>(recorder.events_written() / sec) << " events/sec\n";
+    if (sec > 0) {
+        std::cout << "  Throughput:      " << static_cast<uint64_t>(recorder.events_written() / sec) << " events/sec\n";
+    }
 
     return 0;
 }
@@ -314,7 +242,9 @@ int cmd_replay(const std::string& path) {
               << (min_price / 100.0) << " to " << (max_price / 100.0) << "\n";
     std::cout << "  Timespan:        " << ((last_ts - first_ts) / 1000000.0) << " ms\n";
     std::cout << "  Elapsed time:    " << (duration_sec * 1000.0) << " ms\n";
-    std::cout << "  Throughput:      " << static_cast<uint64_t>(events_replayed / duration_sec) << " events/sec\n";
+    if (duration_sec > 0) {
+        std::cout << "  Throughput:      " << static_cast<uint64_t>(events_replayed / duration_sec) << " events/sec\n";
+    }
 
     return 0;
 }
@@ -331,16 +261,28 @@ int main(int argc, char* argv[]) {
 
     if (mode == "live") {
         bool mock_mode = false;
-        uint32_t token = 3045; // SBIN default
+        std::string yahoo_symbol = "AAPL";
         uint32_t duration_sec = 0;
+
         for (int i = 2; i < argc; ++i) {
             std::string arg = argv[i];
-            if (arg == "--mock") mock_mode = true;
-            else if (arg == "--seconds" && i + 1 < argc) {
+            if (arg == "--mock") {
+                mock_mode = true;
+            } else if (arg == "--yahoo") {
+                mock_mode = false;
+                if (i + 1 < argc && argv[i + 1][0] != '-') {
+                    yahoo_symbol = argv[++i];
+                }
+            } else if (arg == "--seconds" && i + 1 < argc) {
                 duration_sec = static_cast<uint32_t>(std::stoul(argv[++i]));
-            } else token = static_cast<uint32_t>(std::stoul(arg));
+            } else if (!arg.empty() && arg[0] != '-') {
+                // Positional argument: if numeric and mock_mode was set, it's token; else symbol
+                if (!mock_mode) {
+                    yahoo_symbol = arg;
+                }
+            }
         }
-        return cmd_live(mock_mode, token, duration_sec);
+        return cmd_live(mock_mode, yahoo_symbol, duration_sec);
     } else if (mode == "record") {
         if (argc < 3) {
             print_usage(argv[0]);
@@ -348,13 +290,29 @@ int main(int argc, char* argv[]) {
         }
         std::string path = argv[2];
         bool mock_mode = false;
-        size_t count = 50000;
+        std::string yahoo_symbol = "AAPL";
+        size_t count = 50;
+
         for (int i = 3; i < argc; ++i) {
             std::string arg = argv[i];
-            if (arg == "--mock") mock_mode = true;
-            else count = std::stoull(arg);
+            if (arg == "--mock") {
+                mock_mode = true;
+            } else if (arg == "--yahoo") {
+                mock_mode = false;
+                if (i + 1 < argc && argv[i + 1][0] != '-') {
+                    yahoo_symbol = argv[++i];
+                }
+            } else {
+                try {
+                    count = std::stoull(arg);
+                } catch (...) {
+                    if (!mock_mode) {
+                        yahoo_symbol = arg;
+                    }
+                }
+            }
         }
-        return cmd_record(path, mock_mode, count);
+        return cmd_record(path, mock_mode, yahoo_symbol, count);
     } else if (mode == "replay") {
         if (argc < 3) {
             print_usage(argv[0]);

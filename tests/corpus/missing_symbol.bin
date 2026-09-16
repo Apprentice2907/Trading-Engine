@@ -1,0 +1,10 @@
+{
+  "chart": {
+    "result": [{
+      "meta": {
+        "regularMarketPrice": 150.00,
+        "regularMarketVolume": 10000
+      }
+    }]
+  }
+}

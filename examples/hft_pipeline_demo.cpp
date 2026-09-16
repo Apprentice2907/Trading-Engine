@@ -129,25 +129,27 @@ int run_execution_demo() {
     return 0;
 }
 
-int run_integrated_demo(bool mock_mode, uint32_t token, uint32_t duration_sec) {
+int run_integrated_demo(bool mock_mode, const std::string& yahoo_symbol, uint32_t token, uint32_t duration_sec) {
     std::cout << "================================================================================\n";
     std::cout << " [INFRASTRUCTURE DEMO] LIVE MARKET DATA INGESTION + SIMULATED EXECUTION         \n";
     std::cout << "================================================================================\n";
     std::cout << "IMPORTANT NOTICE:\n";
-    std::cout << "  Market Data Feed:  READ-ONLY observation (" << (mock_mode ? "MOCK STREAM" : "ANGEL ONE WEBSOCKET") << ")\n";
+    std::cout << "  Market Data Feed:  READ-ONLY observation (" 
+              << (mock_mode ? "MOCK STREAM" : ("YAHOO FINANCE: " + yahoo_symbol)) << ")\n";
     std::cout << "  Order Execution:   SIMULATED in-memory MatchingEngine (NO real-money orders)\n";
-    std::cout << "  Security Policy:   Credentials read strictly from environment variables\n";
     std::cout << "================================================================================\n\n";
 
     hft::MarketDataPipeline md_pipeline;
     md_pipeline.start();
 
+    uint32_t allowed_token = mock_mode ? token : hft::YahooParser::symbol_hash(yahoo_symbol);
+
     hft::RiskConfig risk_cfg{};
     risk_cfg.max_order_quantity = 500;
     risk_cfg.max_order_notional = 100000000;
-    risk_cfg.min_price = 10000;
-    risk_cfg.max_price = 200000;
-    risk_cfg.allowed_instrument_id = token;
+    risk_cfg.min_price = 1000;
+    risk_cfg.max_price = 100000000;
+    risk_cfg.allowed_instrument_id = allowed_token;
 
     hft::OrderExecutionPipeline exec_pipeline(1024, risk_cfg);
     exec_pipeline.start();
@@ -161,11 +163,11 @@ int run_integrated_demo(bool mock_mode, uint32_t token, uint32_t duration_sec) {
     // Demonstrates event-driven infrastructure: observation triggers deterministic test command
     md_pipeline.set_event_listener([&](const hft::MarketEvent& ev) {
         uint64_t count = ++ticks_received;
-        // Deterministically submit a test order every 20 ticks
-        if (count % 20 == 0 && !g_shutdown.load()) {
+        // Deterministically submit a test order every 5 ticks in demo
+        if (count % 5 == 0 && !g_shutdown.load()) {
             uint64_t order_id = ++sim_order_counter;
-            hft::Side side = (count % 40 == 0) ? hft::Side::Sell : hft::Side::Buy;
-            int64_t price = ev.last_price;
+            hft::Side side = (count % 10 == 0) ? hft::Side::Sell : hft::Side::Buy;
+            int64_t price = ev.last_price > 0 ? ev.last_price : 10000;
             uint32_t qty = 10;
 
             hft::OrderCommand cmd = hft::OrderCommand::make_add(
@@ -174,103 +176,51 @@ int run_integrated_demo(bool mock_mode, uint32_t token, uint32_t duration_sec) {
         }
     });
 
-    auto start_time = std::chrono::steady_clock::now();
-
+    std::unique_ptr<hft::IMarketDataSource> source;
     if (mock_mode) {
-        std::cout << "Streaming ticks & driving simulated execution pipeline for token " << token << "...\n";
-        auto packets = hft::broker::MockAngelFeed::generate_synthetic_stream(100000);
-        size_t idx = 0;
-
-        while (!g_shutdown.load() && idx < packets.size()) {
-            if (duration_sec > 0) {
-                auto now = std::chrono::steady_clock::now();
-                if (std::chrono::duration<double>(now - start_time).count() >= duration_sec) {
-                    break;
-                }
-            }
-
-            hft::MarketEvent ev{};
-            uint64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-            if (hft::broker::AngelDecoder::decode(packets[idx].data(), packets[idx].size(), ev, now_ns)) {
-                md_pipeline.enqueue_event(ev);
-            }
-            ++idx;
-
-            // Poll and display simulated execution reports
-            hft::ExecutionReport rep{};
-            while (exec_pipeline.poll_execution(rep)) {
-                std::cout << "  [SIM-EXEC] Order #" << rep.order_id
-                          << " | " << std::setw(14) << hft::to_string(rep.exec_type)
-                          << " | " << (rep.side == hft::Side::Buy ? "BUY " : "SELL")
-                          << " | Px: " << std::fixed << std::setprecision(2) << (rep.price / 100.0)
-                          << " | Qty: " << rep.last_qty
-                          << " | Leaves: " << rep.leaves_qty << "\n";
-            }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
+        std::cout << "Starting MockMarketDataSource (token " << token << ")...\n";
+        source = std::make_unique<hft::MockMarketDataSource>(100000, token);
+    } else if (!yahoo_symbol.empty()) {
+        std::cout << "Starting YahooMarketDataSource (symbol " << yahoo_symbol << ", token " << allowed_token << ")...\n";
+        source = std::make_unique<hft::YahooMarketDataSource>(yahoo_symbol, 1000);
     } else {
-#ifdef _WIN32
-        auto config = hft::broker::AngelClient::load_config_from_env();
-        if (config.api_key.empty() || config.client_code.empty() || config.feed_token.empty()) {
-            std::cerr << "\n[Error] Angel One credentials missing in environment!\n";
-            std::cerr << "Run with '--mock' to test the integrated pipeline offline.\n";
-            return 1;
-        }
-
-        hft::broker::AngelClient client(config);
-        client.set_packet_callback([&md_pipeline](const uint8_t* data, size_t len) {
-            hft::MarketEvent ev{};
-            uint64_t recv_ts = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-            if (hft::broker::AngelDecoder::decode(data, len, ev, recv_ts)) {
-                md_pipeline.enqueue_event(ev);
-            }
-        });
-
-        if (!client.connect()) {
-            std::cerr << "Failed to connect to Angel One feed.\n";
-            return 1;
-        }
-
-        client.subscribe(token, hft::broker::AngelConstants::MODE_QUOTE);
-        std::thread net_thread([&client]() { client.run_receive_loop(); });
-
-        while (!g_shutdown.load() && client.is_connected()) {
-            if (duration_sec > 0) {
-                auto now = std::chrono::steady_clock::now();
-                if (std::chrono::duration<double>(now - start_time).count() >= duration_sec) {
-                    break;
-                }
-            }
-
-            hft::ExecutionReport rep{};
-            while (exec_pipeline.poll_execution(rep)) {
-                std::cout << "  [SIM-EXEC] Order #" << rep.order_id
-                          << " | " << std::setw(14) << hft::to_string(rep.exec_type)
-                          << " | " << (rep.side == hft::Side::Buy ? "BUY " : "SELL")
-                          << " | Px: " << std::fixed << std::setprecision(2) << (rep.price / 100.0)
-                          << " | Qty: " << rep.last_qty
-                          << " | Leaves: " << rep.leaves_qty << "\n";
-            }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-
-        client.stop();
-        if (net_thread.joinable()) net_thread.join();
-        client.disconnect();
-#else
-        (void)token;
-        (void)duration_sec;
-        (void)start_time;
-        std::cerr << "\n[Notice] Angel One live WebSocket provider is only available on Windows (WinHTTP).\n";
-        std::cerr << "Run with '--mock' to test the integrated pipeline offline on Linux.\n";
+        std::cerr << "Error: Neither --mock nor --yahoo specified.\n";
         return 1;
-#endif
     }
 
+    source->set_callback([&md_pipeline](const hft::MarketEvent& ev) {
+        md_pipeline.enqueue_event(ev);
+    });
+
+    if (!source->start()) {
+        std::cerr << "Failed to start market data source.\n";
+        return 1;
+    }
+
+    auto start_time = std::chrono::steady_clock::now();
+
+    while (!g_shutdown.load() && source->is_running()) {
+        if (duration_sec > 0) {
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration<double>(now - start_time).count() >= duration_sec) {
+                break;
+            }
+        }
+
+        hft::ExecutionReport rep{};
+        while (exec_pipeline.poll_execution(rep)) {
+            std::cout << "  [SIM-EXEC] Order #" << rep.order_id
+                      << " | " << std::setw(14) << hft::to_string(rep.exec_type)
+                      << " | " << (rep.side == hft::Side::Buy ? "BUY " : "SELL")
+                      << " | Px: " << std::fixed << std::setprecision(2) << (rep.price / 100.0)
+                      << " | Qty: " << rep.last_qty
+                      << " | Leaves: " << rep.leaves_qty << "\n";
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    source->stop();
     md_pipeline.stop_and_join();
     exec_pipeline.stop_and_join();
 
@@ -290,27 +240,41 @@ int run_integrated_demo(bool mock_mode, uint32_t token, uint32_t duration_sec) {
 int main(int argc, char* argv[]) {
     bool integrated = false;
     bool mock_mode = false;
+    std::string yahoo_symbol = "";
     uint32_t token = 3045; // SBIN default
     uint32_t seconds = 3;  // default 3s for integrated demo
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--integrated") integrated = true;
-        else if (arg == "--execution") integrated = false;
-        else if (arg == "--mock") mock_mode = true;
-        else if (arg == "--seconds" && i + 1 < argc) seconds = static_cast<uint32_t>(std::stoul(argv[++i]));
-        else if (arg == "--token" && i + 1 < argc) token = static_cast<uint32_t>(std::stoul(argv[++i]));
-        else if (arg == "--help" || arg == "-h") {
+        if (arg == "--integrated") {
+            integrated = true;
+        } else if (arg == "--execution") {
+            integrated = false;
+        } else if (arg == "--mock") {
+            mock_mode = true;
+            integrated = true;
+        } else if (arg == "--yahoo" && i + 1 < argc) {
+            yahoo_symbol = argv[++i];
+            integrated = true;
+        } else if (arg == "--seconds" && i + 1 < argc) {
+            seconds = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--token" && i + 1 < argc) {
+            token = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (arg == "--help" || arg == "-h") {
             std::cout << "HFT Pipeline Demo Tool\n";
             std::cout << "Usage:\n";
             std::cout << "  " << argv[0] << " [--execution]             Deterministic execution pipeline walkthrough\n";
-            std::cout << "  " << argv[0] << " --integrated [--mock] [--seconds N] Ingestion + simulated execution demo\n";
+            std::cout << "  " << argv[0] << " --integrated --mock [--seconds N] Ingestion + simulated execution demo\n";
+            std::cout << "  " << argv[0] << " --integrated --yahoo <SYM> [--seconds N] Live Yahoo ingestion + simulated execution\n";
             return 0;
         }
     }
 
     if (integrated) {
-        return run_integrated_demo(mock_mode, token, seconds);
+        if (!mock_mode && yahoo_symbol.empty()) {
+            mock_mode = true; // default integrated demo to mock
+        }
+        return run_integrated_demo(mock_mode, yahoo_symbol, token, seconds);
     } else {
         return run_execution_demo();
     }

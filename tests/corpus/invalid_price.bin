@@ -1,0 +1,10 @@
+{
+  "chart": {
+    "result": [{
+      "meta": {
+        "symbol": "AAPL",
+        "regularMarketPrice": "abc"
+      }
+    }]
+  }
+}

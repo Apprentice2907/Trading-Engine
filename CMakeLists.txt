@@ -20,27 +20,18 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
-# Core library
-# angel_client.cpp uses WinHTTP which is Windows-only. The rest of the core
-# (order book, matching engine, market data decoder, pipeline) is portable.
+# Core library (Portable C++20 across Windows and Linux)
 # ---------------------------------------------------------------------------
 set(HFT_CORE_SOURCES
     src/order_book.cpp
     src/flat_order_book.cpp
     src/matching_engine.cpp
     src/market_data.cpp
+    src/yahoo_market_data.cpp
     src/trading_pipeline.cpp
 )
 
-if (WIN32)
-    list(APPEND HFT_CORE_SOURCES src/angel_client.cpp)
-endif()
-
 add_library(hft_core STATIC ${HFT_CORE_SOURCES})
-
-if (WIN32)
-    target_link_libraries(hft_core PUBLIC winhttp)
-endif()
 
 target_include_directories(hft_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

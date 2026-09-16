@@ -121,208 +121,140 @@ inline uint32_t compute_market_header_crc32(const MarketFileHeader& hdr) noexcep
     return crc32(0, &hdr, 12);
 }
 
+// Forward declaration
+class MarketDataPipeline;
+
+namespace exchange {
+inline constexpr uint8_t UNKNOWN = 0;
+inline constexpr uint8_t NSE     = 1;
+inline constexpr uint8_t NASDAQ  = 2;
+inline constexpr uint8_t BSE     = 3;
+} // namespace exchange
+
 // ============================================================================
-// 4. Angel One SmartAPI SmartStream Definitions
+// 4. Market Data Source Abstraction & Providers
 // ============================================================================
 
-namespace broker {
-
-struct AngelConstants {
-    static constexpr const char* DEFAULT_WS_HOST = "smartapisocket.angelone.in";
-    static constexpr const char* DEFAULT_WS_PATH = "/smart-stream";
-    static constexpr uint16_t    DEFAULT_WS_PORT = 443;
-
-    static constexpr uint8_t MODE_LTP        = 1;
-    static constexpr uint8_t MODE_QUOTE      = 2;
-    static constexpr uint8_t MODE_SNAP_QUOTE = 3;
-    static constexpr uint8_t MODE_DEPTH      = 4;
-
-    static constexpr size_t PACKET_SIZE_LTP        = 51;
-    static constexpr size_t PACKET_SIZE_QUOTE      = 147;
-    static constexpr size_t PACKET_SIZE_SNAP_QUOTE = 347;
-
-    static constexpr uint8_t EXCH_NSE_CM = 1;
-    static constexpr uint8_t EXCH_NSE_FO = 2;
-    static constexpr uint8_t EXCH_BSE_CM = 3;
-    static constexpr uint8_t EXCH_BSE_FO = 4;
-    static constexpr uint8_t EXCH_MCX_FO = 5;
-    static constexpr uint8_t EXCH_NCX_FO = 7;
-    static constexpr uint8_t EXCH_CDE_FO = 13;
-};
-
-enum class ConnectionState : uint8_t {
-    Disconnected = 0,
-    Connecting,
-    Connected,
-    Subscribed,
-    Reconnecting,
-    Error
-};
-
-struct AngelConfig {
-    std::string api_key;
-    std::string client_code;
-    std::string feed_token;
-    std::string jwt_token;
-
-    uint32_t instrument_token{3045};
-    uint8_t  exchange_type{AngelConstants::EXCH_NSE_CM};
-    uint8_t  subscription_mode{AngelConstants::MODE_QUOTE};
-
-    uint32_t ping_interval_sec{10};
-    uint32_t reconnect_delay_ms{2000};
-    uint32_t max_reconnect_attempts{5};
-
-    std::string host{AngelConstants::DEFAULT_WS_HOST};
-    std::string path{AngelConstants::DEFAULT_WS_PATH};
-    uint16_t    port{AngelConstants::DEFAULT_WS_PORT};
-};
-
-struct BrokerStats {
-    std::atomic<uint64_t> received_packets{0};
-    std::atomic<uint64_t> decoded_events{0};
-    std::atomic<uint64_t> normalized_events{0};
-    std::atomic<uint64_t> queued_events{0};
-    std::atomic<uint64_t> dropped_events{0};
-
-    void reset() noexcept {
-        received_packets.store(0, std::memory_order_relaxed);
-        decoded_events.store(0, std::memory_order_relaxed);
-        normalized_events.store(0, std::memory_order_relaxed);
-        queued_events.store(0, std::memory_order_relaxed);
-        dropped_events.store(0, std::memory_order_relaxed);
-    }
-};
-
-class AngelDecoder {
+class IMarketDataSource {
 public:
-    static bool decode(const uint8_t* data, size_t length, MarketEvent& out_event,
-                       uint64_t receive_ts_ns) noexcept;
-    static uint32_t parse_token(const char* token_bytes, size_t max_len = 25) noexcept;
+    using EventCallback = std::function<void(const MarketEvent&)>;
+    using MarketEventCallback = EventCallback;
+
+    virtual ~IMarketDataSource() = default;
+    virtual void set_event_callback(EventCallback cb) = 0;
+    void set_callback(EventCallback cb) { set_event_callback(std::move(cb)); }
+    virtual bool start() = 0;
+    virtual void stop() = 0;
+    [[nodiscard]] virtual bool running() const noexcept = 0;
+    [[nodiscard]] bool is_running() const noexcept { return running(); }
+};
+
+// --- Mock Market Data Source (Deterministic Synthetic Feeds) ---
+class MockMarketDataSource : public IMarketDataSource {
+public:
+    explicit MockMarketDataSource(size_t event_count = 1000, uint32_t token = 3045);
+    ~MockMarketDataSource() override;
+
+    MockMarketDataSource(const MockMarketDataSource&) = delete;
+    MockMarketDataSource& operator=(const MockMarketDataSource&) = delete;
+
+    void set_event_callback(EventCallback cb) override { event_callback_ = std::move(cb); }
+    void attach_pipeline(MarketDataPipeline* pipeline) { pipeline_ = pipeline; }
+
+    bool start() override;
+    void stop() override;
+    [[nodiscard]] bool running() const noexcept override { return running_.load(std::memory_order_relaxed); }
+
+    static std::vector<MarketEvent> generate_events(size_t count, uint32_t token = 3045, uint64_t seed = 0x12345678ULL);
 
 private:
-    static int64_t read_i64_le(const uint8_t* p) noexcept {
-        uint64_t v = static_cast<uint64_t>(p[0]) |
-                     (static_cast<uint64_t>(p[1]) << 8) |
-                     (static_cast<uint64_t>(p[2]) << 16) |
-                     (static_cast<uint64_t>(p[3]) << 24) |
-                     (static_cast<uint64_t>(p[4]) << 32) |
-                     (static_cast<uint64_t>(p[5]) << 40) |
-                     (static_cast<uint64_t>(p[6]) << 48) |
-                     (static_cast<uint64_t>(p[7]) << 56);
-        return static_cast<int64_t>(v);
-    }
+    void worker_loop();
 
-    static uint64_t read_u64_le(const uint8_t* p) noexcept {
-        return static_cast<uint64_t>(p[0]) |
-               (static_cast<uint64_t>(p[1]) << 8) |
-               (static_cast<uint64_t>(p[2]) << 16) |
-               (static_cast<uint64_t>(p[3]) << 24) |
-               (static_cast<uint64_t>(p[4]) << 32) |
-               (static_cast<uint64_t>(p[5]) << 40) |
-               (static_cast<uint64_t>(p[6]) << 48) |
-               (static_cast<uint64_t>(p[7]) << 56);
-    }
-};
-
-class MockAngelFeed {
-public:
-    static size_t build_ltp_packet(uint8_t* out_buf, size_t buf_size,
-                                   const char* token, int64_t ltp_paise,
-                                   uint64_t seq, int64_t ts_ms,
-                                   uint8_t exchange = AngelConstants::EXCH_NSE_CM);
-
-    static size_t build_quote_packet(uint8_t* out_buf, size_t buf_size,
-                                     const char* token, int64_t ltp_paise,
-                                     uint64_t last_qty, uint64_t seq,
-                                     int64_t ts_ms, uint64_t volume,
-                                     int64_t open, int64_t high, int64_t low, int64_t close,
-                                     uint8_t exchange = AngelConstants::EXCH_NSE_CM);
-
-    static size_t build_snap_quote_packet(uint8_t* out_buf, size_t buf_size,
-                                          const char* token, int64_t ltp_paise,
-                                          uint64_t last_qty, int64_t bid_paise,
-                                          uint64_t bid_qty, int64_t ask_paise,
-                                          uint64_t ask_qty, uint64_t seq,
-                                          int64_t ts_ms, uint64_t volume,
-                                          uint8_t exchange = AngelConstants::EXCH_NSE_CM);
-
-    static std::vector<std::vector<uint8_t>> generate_synthetic_stream(size_t count,
-                                                                       uint64_t seed = 0x12345678ULL);
-
-private:
-    static void write_u64_le(uint8_t* p, uint64_t v) noexcept {
-        p[0] = static_cast<uint8_t>(v & 0xFF);
-        p[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
-        p[2] = static_cast<uint8_t>((v >> 16) & 0xFF);
-        p[3] = static_cast<uint8_t>((v >> 24) & 0xFF);
-        p[4] = static_cast<uint8_t>((v >> 32) & 0xFF);
-        p[5] = static_cast<uint8_t>((v >> 40) & 0xFF);
-        p[6] = static_cast<uint8_t>((v >> 48) & 0xFF);
-        p[7] = static_cast<uint8_t>((v >> 56) & 0xFF);
-    }
-
-    static void write_i64_le(uint8_t* p, int64_t v) noexcept {
-        write_u64_le(p, static_cast<uint64_t>(v));
-    }
-};
-
-class AngelClient {
-public:
-    using PacketCallback = std::function<void(const uint8_t* data, size_t length)>;
-
-    explicit AngelClient(AngelConfig config);
-    ~AngelClient();
-
-    AngelClient(const AngelClient&) = delete;
-    AngelClient& operator=(const AngelClient&) = delete;
-    AngelClient(AngelClient&& other) noexcept;
-    AngelClient& operator=(AngelClient&& other) noexcept;
-
-    bool connect();
-    bool subscribe(uint32_t token, uint8_t mode = AngelConstants::MODE_QUOTE,
-                   uint8_t exchange = AngelConstants::EXCH_NSE_CM);
-    bool send_ping();
-    void run_receive_loop();
-    void stop();
-    void disconnect();
-
-    void set_packet_callback(PacketCallback callback) {
-        packet_callback_ = std::move(callback);
-    }
-
-    [[nodiscard]] bool is_connected() const noexcept {
-        return state_.load(std::memory_order_relaxed) == ConnectionState::Connected ||
-               state_.load(std::memory_order_relaxed) == ConnectionState::Subscribed;
-    }
-
-    [[nodiscard]] ConnectionState state() const noexcept {
-        return state_.load(std::memory_order_relaxed);
-    }
-
-    [[nodiscard]] const BrokerStats& stats() const noexcept { return stats_; }
-    [[nodiscard]] BrokerStats& stats() noexcept { return stats_; }
-
-    static AngelConfig load_config_from_env();
-
-private:
-    void heartbeat_worker();
-
-    AngelConfig config_;
-    BrokerStats stats_;
-    std::atomic<ConnectionState> state_{ConnectionState::Disconnected};
+    size_t event_count_{1000};
+    uint32_t token_{3045};
+    EventCallback event_callback_;
+    MarketDataPipeline* pipeline_{nullptr};
     std::atomic<bool> running_{false};
-    PacketCallback packet_callback_;
-
-    void* h_session_{nullptr};
-    void* h_connect_{nullptr};
-    void* h_request_{nullptr};
-    void* h_websocket_{nullptr};
-
-    std::unique_ptr<std::thread> heartbeat_thread_;
+    std::thread worker_thread_;
 };
 
-} // namespace broker
+// --- Replay Market Data Source (Plays from .mktlog) ---
+class ReplayMarketDataSource : public IMarketDataSource {
+public:
+    explicit ReplayMarketDataSource(std::string mktlog_path);
+    ~ReplayMarketDataSource() override;
+
+    ReplayMarketDataSource(const ReplayMarketDataSource&) = delete;
+    ReplayMarketDataSource& operator=(const ReplayMarketDataSource&) = delete;
+
+    void set_event_callback(EventCallback cb) override { event_callback_ = std::move(cb); }
+    void attach_pipeline(MarketDataPipeline* pipeline) { pipeline_ = pipeline; }
+
+    bool start() override;
+    void stop() override;
+    [[nodiscard]] bool running() const noexcept override { return running_.load(std::memory_order_relaxed); }
+
+private:
+    void worker_loop();
+
+    std::string path_;
+    EventCallback event_callback_;
+    MarketDataPipeline* pipeline_{nullptr};
+    std::atomic<bool> running_{false};
+    std::thread worker_thread_;
+};
+
+// --- Yahoo Finance Configuration & Parser ---
+struct YahooConfig {
+    std::vector<std::string> symbols{"RELIANCE.NS", "TCS.NS", "AAPL"};
+    uint32_t poll_interval_ms{1000};
+    std::string user_agent{"Mozilla/5.0 (Windows NT 10.0; Win64; x64)"};
+};
+
+class YahooParser {
+public:
+    // Parses a single Yahoo Finance v8 chart JSON payload into a normalized MarketEvent.
+    // Returns true on success, false on error/invalid input without crashing or throwing.
+    static bool parse(std::string_view json, MarketEvent& out_event, uint64_t receive_ts_ns = 0) noexcept;
+
+    // Deterministic FNV-1a 32-bit hash for ticker symbols
+    static uint32_t symbol_hash(std::string_view sym) noexcept;
+};
+
+// --- Yahoo Finance Market Data Source (External Dev/Test Provider) ---
+class YahooMarketDataSource : public IMarketDataSource {
+public:
+    explicit YahooMarketDataSource(YahooConfig config = {});
+    YahooMarketDataSource(std::string symbol, uint32_t poll_interval_ms)
+        : YahooMarketDataSource(YahooConfig{{std::move(symbol)}, poll_interval_ms}) {}
+    ~YahooMarketDataSource() override;
+
+    YahooMarketDataSource(const YahooMarketDataSource&) = delete;
+    YahooMarketDataSource& operator=(const YahooMarketDataSource&) = delete;
+
+    void set_event_callback(EventCallback cb) override { event_callback_ = std::move(cb); }
+    void attach_pipeline(MarketDataPipeline* pipeline) { pipeline_ = pipeline; }
+
+    bool start() override;
+    void stop() override;
+    [[nodiscard]] bool running() const noexcept override { return running_.load(std::memory_order_relaxed); }
+
+    // Synchronously polls configured symbols once; useful for CLI, testing, and inspection
+    bool poll_once();
+
+    // Internal fetcher using native system curl (zero third-party dependencies)
+    static std::string fetch_symbol_http(const std::string& symbol, const std::string& user_agent);
+
+private:
+    void worker_loop();
+
+    YahooConfig config_;
+    EventCallback event_callback_;
+    MarketDataPipeline* pipeline_{nullptr};
+    std::atomic<bool> running_{false};
+    std::thread worker_thread_;
+    std::atomic<uint64_t> sequence_{0};
+};
 
 // ============================================================================
 // 5. Binary Recorder and Replayer (.mktlog)

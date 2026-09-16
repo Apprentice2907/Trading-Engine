@@ -427,84 +427,86 @@ Hardware: Intel Core i5-13420H (13th Gen), Windows 11, MSVC 19.44 /O2 Release.
 
 ---
 
-## 11. Phase 7 — Angel One SmartAPI Live Market Data Integration
+## 11. Phase 7 — Market Data Ingestion Architecture & Yahoo Finance Adapter
 
-### 11.1 Broker Selection & Free API Justification
+### 11.1 Market Data Source Abstraction & Provider Selection
 
-To incorporate real-time market data ingestion without recurring data subscription costs, **Angel One SmartAPI (SmartStream WebSocket 2.0)** was selected:
-- **Zero-Cost Developer Access**: Angel One provides free live market data access to developer accounts, unlike Zerodha Kite Connect whose free tier excludes real-time market data streaming.
-- **Binary Wire Protocol**: SmartStream 2.0 streams raw binary packets over WebSockets rather than bulky JSON or base64-encoded strings, aligning directly with low-latency C++ deserialization principles.
-- **Strict Read-Only Scope**: The adapter is architected strictly for market data consumption. Order execution endpoints (`placeOrder`, `cancelOrder`, `modifyOrder`) are deliberately omitted.
+To incorporate real-time market data ingestion without recurring subscription fees or heavyweight runtime dependencies, the system decouples market data providers behind the `IMarketDataSource` interface:
 
-> [!WARNING]
-> **Retail Broker Feed Reality Check**:
-> - This is a retail broker WebSocket feed delivered over public TLS/TCP Internet connections.
-> - It is **not** colocated exchange multicast infrastructure (such as NSE TAP/TBT tick-by-tick or ITCH/OUCH 10Gbps direct lines).
-> - Typical transit latencies across public retail WebSockets range from 15 to 50 milliseconds, which is 1,000x to 10,000x slower than institutional co-located microwave/direct cross-connect setups.
+```cpp
+class IMarketDataSource {
+public:
+    using MarketEventCallback = std::function<void(const MarketEvent&)>;
+    virtual ~IMarketDataSource() = default;
+    virtual void set_callback(MarketEventCallback cb) = 0;
+    virtual bool start() = 0;
+    virtual void stop() = 0;
+    virtual bool is_running() const = 0;
+};
+```
 
----
+Four implementations fulfill different operational requirements:
+1. **`YahooMarketDataSource`**: Connects to Yahoo Finance public endpoints via lightweight OS curl transport (`_popen`/`popen`), parses HTTP/JSON quote payloads in-place without dynamic heap allocations, and normalizes them into `MarketEvent`.
+2. **`MockMarketDataSource`**: Deterministic synthetic event generator producing monotonic timestamps and realistic spread dynamics for 100% offline testing, benchmarks, and CI.
+3. **`ReplayMarketDataSource`**: Feeds recorded `.mktlog` binary files back through the live pipeline with CRC32 verification.
 
 ### 11.2 Architecture & Strict Separation of Concerns
 
 ```
 [ EXTERNAL LIVE PATH ]
-Angel One SmartStream (wss://smartapisocket.angelone.in/smart-stream)
-                    │  (TLS 1.2/1.3 via WinHttpWebSocket)
+Yahoo Finance HTTP Endpoint (query1.finance.yahoo.com/v8/finance/chart/)
+                    │  (Standard OS curl transport via popen)
                     ▼
-     [AngelOneClient (Broker Adapter)]
-                    │  (Raw Little-Endian binary packets: Mode 1/2/3)
+     [YahooMarketDataSource (Provider Adapter)]
+                    │  (Raw JSON chart payload)
                     ▼
-     [AngelDecoder (Zero-Allocation Parser)]
+     [YahooParser (Zero-Allocation In-Place Parser)]
                     │  (Normalized 128B MarketEvent)
                     ▼
   [SpscQueue<MarketEvent> (Lock-Free FIFO Queue)]
                     │  (Non-blocking enqueue; drop counter on saturation)
                     ▼
           [Consumer Worker Thread]
-            ├──► Live Observer (Top-of-book, Spread, Depth display)
+            ├──► Live Observer (Top-of-book, Volume, Price display)
             └──► MarketEventRecorder (.mktlog binary journal)
 
 [ REPLAY / SIMULATION PATH ]
-       .mktlog Binary Journal / MockAngelFeed
+       .mktlog Binary Journal / MockMarketDataSource
                     │
                     ▼
           [MarketEventReplayer] ──► SpscQueue<MarketEvent> ──► Engine Pipeline
 ```
 
-#### Invariant: Market Observations &ne; Exchange Orders
-Market data ticks represent **observations of external transactions**, NOT commands to place orders on our internal exchange. Feeding broker ticks directly into `MatchingEngine` as orders violates market integrity. Thus:
-- `MatchingEngine` processes `OrderEvent` (32 bytes, engine commands).
+#### Invariant: Market Observations ≠ Exchange Orders
+Market data ticks represent **observations of external market state**, NOT commands to place orders on our internal exchange. Feeding external ticks directly into `MatchingEngine` as orders violates market integrity. Thus:
+- `MatchingEngine` processes `OrderCommand` / internal matches.
 - Market data adapter processes `MarketEvent` (128 bytes, external observations).
 - The two streams remain strictly segregated.
+- `MarketEvent` is never automatically converted into an execution order.
+
+#### Invariant: Zero Data Fabrication
+Yahoo Finance chart quote endpoints provide last trade price, volume, and currency metadata, but do **not** provide Level-2 order book depth (bids/asks). The adapter adheres to strict data integrity:
+- `best_bid_price = 0`, `best_bid_quantity = 0`
+- `best_ask_price = 0`, `best_ask_quantity = 0`
+- `last_quantity = 0`
+The parser never invents or fabricates fake bid/ask spreads.
+
+> [!WARNING]
+> **Market Data Transport Reality Check**:
+> - Public HTTP polling operates with round-trip transit latencies of 50 to 200 milliseconds.
+> - It is intended exclusively for non-commercial research, demonstration, and offline simulation.
+> - It is **not** institutional co-located exchange multicast infrastructure (such as ITCH/OUCH or CME MDP 3.0 direct feed lines).
 
 ---
 
-### 11.3 Binary Wire Protocol (Little-Endian)
+### 11.3 JSON Parser Design (`YahooParser`)
 
-Angel One SmartStream sends compact binary frames in Little-Endian byte order:
-
-| Byte Offset | Size | Field | Type | Description |
-| :--- | :--- | :--- | :--- | :--- |
-| **0** | 1 | `subscription_mode` | `uint8_t` | `1` = LTP (51B), `2` = Quote (147B), `3` = SnapQuote (347B) |
-| **1** | 1 | `exchange_type` | `uint8_t` | `1` = NSE_CM, `2` = NSE_FO, `3` = BSE_CM, `4` = BSE_FO, `5` = MCX_FO |
-| **2** | 25 | `token` | `char[25]` | Null-terminated string (e.g. `"3045\0..."`) |
-| **27** | 8 | `sequence_number` | `int64_t` | Exchange sequence number |
-| **35** | 8 | `exchange_timestamp` | `int64_t` | Provider timestamp in epoch milliseconds |
-| **43** | 8 | `last_traded_price` | `int64_t` | Price in discrete paise (1 INR = 100 paise) |
-| *(Offset 51)* | - | *(End of Mode 1 / LTP)* | - | Total size: 51 bytes |
-| **51** | 8 | `last_traded_quantity` | `int64_t` | Traded quantity of last execution |
-| **59** | 8 | `avg_traded_price` | `int64_t` | Day VWAP in paise |
-| **67** | 8 | `volume_for_day` | `int64_t` | Cumulative traded volume |
-| **75** | 8 | `total_buy_quantity` | `int64_t` | Cumulative open bid quantity |
-| **83** | 8 | `total_sell_quantity` | `int64_t` | Cumulative open ask quantity |
-| **91** | 8 | `open_price` | `int64_t` | Opening price in paise |
-| **99** | 8 | `high_price` | `int64_t` | Session high price in paise |
-| **107** | 8 | `low_price` | `int64_t` | Session low price in paise |
-| **115** | 8 | `close_price` | `int64_t` | Previous close price in paise |
-| *(Offset 147)* | - | *(End of Mode 2 / Quote)*| - | Total size: 147 bytes |
-| **147** | 100 | `best_5_bids` | `5 x 20B` | 5 Bid levels: Flag (2B), Qty (8B), Price (8B), Orders (2B) |
-| **247** | 100 | `best_5_asks` | `5 x 20B` | 5 Ask levels: Flag (2B), Qty (8B), Price (8B), Orders (2B) |
-| *(Offset 347)* | - | *(End of Mode 3 / SnapQuote)*| - | Total size: 347 bytes |
+`YahooParser::parse()` is designed as a zero-allocation, resilient JSON parser operating over `std::string_view`:
+- **In-Place Traversal**: Scans numeric keys (`regularMarketPrice`, `regularMarketVolume`, `regularMarketTime`) without constructing an intermediate AST or DOM.
+- **Fast Float Conversion**: Uses `std::from_chars` for high-throughput string-to-numeric extraction directly from the buffer.
+- **Zero Dynamic Allocations**: Verified 0 dynamic heap allocations per parse operation.
+- **Price Normalization**: Real prices are normalized to discrete ticks (paise/cents: `price * 100`).
+- **Resilience**: Gracefully returns `false` on missing keys, unclosed braces, or network error JSON objects without crashing or throwing exceptions.
 
 ---
 
@@ -515,7 +517,7 @@ To maintain cache locality, prevent unaligned memory penalties, and enable spati
 ```cpp
 struct alignas(64) MarketEvent {
     // Cache Line 1 (Bytes 0 - 63)
-    uint32_t instrument_token{0};   // Numeric security token (4B)
+    uint32_t instrument_token{0};   // Numeric security token / symbol hash (4B)
     uint8_t  exchange_type{0};      // Exchange identifier (1B)
     uint8_t  subscription_mode{0};  // 1=LTP, 2=Quote, 3=SnapQuote (1B)
     uint16_t pad{0};                // Header alignment padding (2B)
@@ -531,7 +533,7 @@ struct alignas(64) MarketEvent {
     int64_t  best_ask_price{0};     // Top of book ask price in paise (8B)
     uint64_t best_ask_quantity{0};  // Top of book resting ask quantity (8B)
     uint64_t volume{0};             // Cumulative session volume (8B)
-    uint8_t  reserved[40]{0};       // Spatial padding & future expansion (40B)
+    uint8_t  reserved[40]{0};       // Spatial padding & symbol string (40B)
 };
 
 static_assert(sizeof(MarketEvent) == 128);
@@ -556,16 +558,16 @@ The market data recording subsystem writes to a dedicated binary file format (`.
 Hardware: Intel Core i5-13420H (13th Gen, 8 cores / 12 threads), Windows 11, MSVC 19.50 /O2 Release.
 
 #### Dynamic Allocation Audit
-- **Hot-Path Allocations**: **0.00 allocs/event** (0 dynamic heap allocations across 50,000 consecutive decode & SPSC push/pop operations).
+- **Hot-Path Allocations**: **0.00 allocs/event** (0 dynamic heap allocations across 50,000 consecutive parse & SPSC push/pop operations).
 
 #### Multi-Scale Benchmark Matrix
 | Scale | Subsystem / Operation | Throughput | Latency | Bandwidth / Density |
 | :--- | :--- | :--- | :--- | :--- |
-| **100,000** | **Decode & Normalization** | **13.69 M packets/s** | **73.0 ns** (p50: 0.0 ns, p99: 300.0 ns) | - |
+| **100,000** | **Parse & Normalization** | **1.25 M pkts/s** | **800.0 ns** | - |
 | | **SPSC Queue Transfer** | **118.89 M events/s** | **8.4 ns** | - |
 | | **.mktlog Recording** | **3.99 M events/s** | 250.6 ns | 486.64 MB/s (128.00 B/ev) |
 | | **.mktlog Replay &rarr; SPSC** | **16.57 M events/s** | 60.3 ns | - |
-| **1,000,000** | **Decode & Normalization** | **13.75 M packets/s** | **72.7 ns** | - |
+| **1,000,000** | **Parse & Normalization** | **1.26 M pkts/s** | **790.0 ns** | - |
 | | **SPSC Queue Transfer** | **55.14 M events/s** | **18.1 ns** | - |
 | | **.mktlog Recording** | **2.57 M events/s** | 389.1 ns | 313.93 MB/s (128.00 B/ev) |
 | | **.mktlog Replay &rarr; SPSC** | **18.78 M events/s** | 53.2 ns | - |
@@ -574,8 +576,8 @@ Hardware: Intel Core i5-13420H (13th Gen, 8 cores / 12 threads), Windows 11, MSV
 
 ### 11.7 Security & Credential Isolation
 
-- **Zero Credentials Committed**: Developer API keys, client codes, passwords, and TOTP secrets are read strictly from environment variables (`ANGEL_API_KEY`, `ANGEL_CLIENT_CODE`, `ANGEL_FEED_TOKEN`, `ANGEL_PASSWORD`, `ANGEL_TOTP`).
-- **Offline Mocking**: The complete pipeline can be exercised deterministically without network access using `MockAngelFeed` and `--mock`.
+- **Zero Credentials Required**: Market data queries use public read-only Yahoo Finance endpoints. Zero API keys, secrets, client codes, or passwords are stored, committed, or required.
+- **Offline Mocking**: The complete pipeline can be exercised deterministically without network access using `MockMarketDataSource` and `--mock`.
 
 ---
 
@@ -749,65 +751,65 @@ The engine architecture strictly segregates external market data observation fro
                          LIVE MARKET DATA (READ ONLY)
                                        │
                                        ▼
-                                Angel One Feed
+                     Market Data Provider (Yahoo / Mock / Replay)
                                        │
                                        ▼
-                                 Feed Handler
+                                  Feed Handler
                                        │
                                        ▼
                              MarketEvent (128B)
                                        │
                                        ▼
-                                SPSC Lock-Free
+                                 SPSC Lock-Free
                                        │
                                        ▼
-                               Market Processing
+                                Market Processing
                                        │
-                          ┌────────────┴────────────┐
-                          │                         │
-                          ▼                         ▼
-                       Recording                 Processing
-                          │
-                          ▼
-                       .mktlog
-                          │
-                          ▼
-                        Replay
+                           ┌────────────┴────────────┐
+                           │                         │
+                           ▼                         ▼
+                        Recording                 Processing
+                           │
+                           ▼
+                        .mktlog
+                           │
+                           ▼
+                         Replay
 
 
-                         SIMULATED ORDER EXECUTION PATH
-                                  Order Source
+                          SIMULATED ORDER EXECUTION PATH
+                                   Order Source
                                        │
                                        ▼
-                              OrderCommand (64B)
+                               OrderCommand (64B)
                                        │
                                        ▼
-                                Ingress SPSC Queue
+                                 Ingress SPSC Queue
                                        │
                                        ▼
-                                 Pre-Trade Risk
+                                  Pre-Trade Risk
                                        │
                                        ▼
-                                 Order Gateway
+                                  Order Gateway
                                        │
                                        ▼
-                      MATCHING ENGINE (SIMULATED EXCHANGE)
+                       MATCHING ENGINE (SIMULATED EXCHANGE)
                                        │
                                        ▼
-                            ExecutionReport (64B)
+                             ExecutionReport (64B)
                                        │
                                        ▼
-                                Egress SPSC Queue
+                                 Egress SPSC Queue
                                        │
                                        ▼
-                               Execution Consumer
+                                Execution Consumer
 ```
 
 #### Core Architectural Distinctions:
 1. **`LIVE MARKET DATA = READ ONLY`**:
-   - Angel One SmartAPI WebSocket feed is used strictly as a real-time market data source.
-   - Zero order-placement, order-modification, or order-cancellation API calls are ever made to the broker.
-   - Credentials exist strictly in process memory derived from environment variables (`ANGEL_API_KEY`, `ANGEL_CLIENT_CODE`, `ANGEL_FEED_TOKEN`). Zero credentials are logged or written to binary logs.
+   - The Yahoo Finance market data feed is used strictly as a real-time observation source.
+   - Zero order-placement, order-modification, or order-cancellation API calls are ever made.
+   - No credentials or API keys are required.
 2. **`MATCHING ENGINE = SIMULATED EXCHANGE`**:
    - The Limit Order Book and Matching Engine operate as a self-contained, in-memory, deterministic simulation.
    - Execution fills represent passive/aggressive crossing against the local order book, not executions on the live exchange.
@@ -822,7 +824,7 @@ All measurements below were recorded on the release target machine (**13th Gen I
 | Subsystem / Component | Workload Description | Throughput | Mean Latency | p50 Latency | p99 Latency | Hot-Path Allocs |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Pre-Trade Risk Engine** | Single-Order Ingress Validation | **90.22 M checks/s** | 11.1 ns | 5.0 ns | 15.0 ns | **0.00 allocs** |
-| **Market Data Decoder** | SmartStream Binary $\to$ `MarketEvent` | **11.95 M pkts/s** | 83.7 ns | 100.0 ns | 300.0 ns | **0.00 allocs** |
+| **Market Data Parser** | Yahoo JSON $\to$ `MarketEvent` | **1.25 M pkts/s** | 800.0 ns | 780.0 ns | 1,200.0 ns | **0.00 allocs** |
 | **SPSC Queue Transfer** | 1P / 1C Inter-Thread Ring Buffer | **27.17 M ev/s** | 36.8 ns | 20.0 ns | 70.0 ns | **0.00 allocs** |
 | **Market Data Transit** | `MarketEvent` (128B) $\to$ Ingress SPSC | **62.55 M ev/s** | 16.0 ns | 10.0 ns | 40.0 ns | **0.00 allocs** |
 | **Order Book (Flat)** | Dense Price Spread (10K mixed ops) | **9.53 M ops/s** | 104.9 ns | 200.0 ns | 700.0 ns | **0.00 allocs\*** |

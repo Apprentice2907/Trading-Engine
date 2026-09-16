@@ -28,6 +28,7 @@ jobs:
             -Iinclude \
             tests/fuzz_decoder.cpp \
             src/market_data.cpp \
+            src/yahoo_market_data.cpp \
             -o fuzz_decoder
 
       - name: Verify libFuzzer target type and arguments

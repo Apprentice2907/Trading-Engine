@@ -1,0 +1,15 @@
+{
+  "chart": {
+    "result": [{
+      "meta": {
+        "currency": "INR",
+        "symbol": "RELIANCE.NS",
+        "exchangeName": "NSE",
+        "regularMarketTime": 1710001000,
+        "regularMarketPrice": 2985.75,
+        "regularMarketVolume": 8500000
+      }
+    }],
+    "error": null
+  }
+}

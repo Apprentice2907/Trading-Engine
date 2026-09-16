@@ -1,23 +1,23 @@
-// fuzz_decoder.cpp — libFuzzer entry point for AngelDecoder::decode().
+// fuzz_decoder.cpp — libFuzzer entry point for YahooParser::parse().
 //
 // Build with: cmake -DHFT_ENABLE_FUZZING=ON (requires Clang + libFuzzer)
 //
 // Example run:
-//   ./fuzz_decoder tests/corpus/ -max_len=512 -jobs=4 -workers=4
+//   ./fuzz_decoder tests/corpus/ -max_len=1024 -jobs=4 -workers=4
 //
 // Fuzzing targets:
-//   1. Length-0 and length-1 inputs (null-termination edge cases)
-//   2. All mode bytes: 0, 1 (LTP), 2 (Quote), 3 (SnapQuote), 4, 255
-//   3. Token field (bytes [2..26]): all-9s (overflow), all-0s, mixed
-//   4. Timestamp field (bytes [35..42]): INT64_MIN, INT64_MAX, negative
-//   5. Exact-boundary lengths (PACKET_SIZE_LTP-1, PACKET_SIZE_LTP, etc.)
-//   6. Arbitrary random payloads up to 512 bytes
+//   1. Length-0, length-1, and truncated inputs
+//   2. Deeply nested JSON, malformed tokens, unclosed strings
+//   3. Missing fields (no symbol, no price, no meta)
+//   4. Numerical edge cases (NaN, infinity, overflow, negative, zero)
+//   5. Semantic invariants: zero-bid/ask guarantee, non-zero hash
 
 #include "hft/market_data.hpp"
 
 #include <cstdint>
 #include <cstddef>
 #include <cstdlib>
+#include <string_view>
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
@@ -29,18 +29,27 @@
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     hft::MarketEvent event{};
 
-    // The decode function must never crash, trigger UB, or access out of bounds.
-    // It returns false for malformed input; we only care that it doesn't crash.
-    (void)hft::broker::AngelDecoder::decode(data, size, event, 0);
+    std::string_view sv(reinterpret_cast<const char*>(data), size);
+    bool ok = hft::YahooParser::parse(sv, event, 0);
 
-    // Additional semantic invariants for valid packets:
-    // - exchange_type must be a known value (0 = unknown but not a crash)
-    // - last_price, best_bid_price, best_ask_price may be any int64 (no overflow check needed here)
-    // - instrument_token must be <= 999999999 (parse_token cap at 9 digits)
-    if (event.instrument_token > 999999999u) {
-        // This should never happen given our 9-digit cap.
-        // If it does, record this input as an issue.
-        FUZZER_TRAP();
+    // Semantic invariants when parse succeeds:
+    if (ok) {
+        // 1. Yahoo adapter must NEVER fabricate bid/ask or quote quantity
+        if (event.best_bid_price != 0 || event.best_ask_price != 0 ||
+            event.best_bid_quantity != 0 || event.best_ask_quantity != 0 ||
+            event.last_quantity != 0) {
+            FUZZER_TRAP();
+        }
+
+        // 2. Token must be valid non-zero hash
+        if (event.instrument_token == 0) {
+            FUZZER_TRAP();
+        }
+
+        // 3. Price must be strictly positive
+        if (event.last_price <= 0) {
+            FUZZER_TRAP();
+        }
     }
 
     return 0;
@@ -63,7 +72,7 @@ int main(int argc, char** argv) {
         std::filesystem::path p(argv[i]);
         if (std::filesystem::is_directory(p)) {
             for (const auto& entry : std::filesystem::recursive_directory_iterator(p)) {
-                if (entry.is_regular_file() && entry.path().extension() == ".bin") {
+                if (entry.is_regular_file() && (entry.path().extension() == ".bin" || entry.path().extension() == ".json")) {
                     std::ifstream f(entry.path(), std::ios::binary | std::ios::ate);
                     if (f) {
                         const auto size = f.tellg();

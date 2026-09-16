@@ -1,0 +1,11 @@
+{
+  "chart": {
+    "result": [{
+      "meta": {
+        "symbol": "AAPL",
+        "regularMarketPrice": 100.0,
+        "regularMarketVolume": 999999999999999
+      }
+    }]
+  }
+}

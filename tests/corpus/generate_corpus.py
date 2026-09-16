@@ -1,127 +1,197 @@
 #!/usr/bin/env python3
-"""Generate adversarial seed corpus for fuzz_decoder."""
+"""Generate adversarial seed corpus for fuzz_decoder (YahooParser)."""
 
-import struct, os, pathlib
+import pathlib
 
 OUT = pathlib.Path(__file__).parent
 
 def write(name, data):
+    if isinstance(data, str):
+        data = data.encode('utf-8')
     (OUT / name).write_bytes(data)
 
-# Constants (from AngelConstants in market_data.hpp)
-PACKET_LTP        = 51
-PACKET_QUOTE      = 147
-PACKET_SNAP_QUOTE = 347
+# 1. Valid US Quote
+write("valid_us.bin", """{
+  "chart": {
+    "result": [{
+      "meta": {
+        "currency": "USD",
+        "symbol": "AAPL",
+        "exchangeName": "NMS",
+        "instrumentType": "EQUITY",
+        "regularMarketTime": 1710000000,
+        "regularMarketPrice": 185.50,
+        "regularMarketVolume": 45000000
+      }
+    }],
+    "error": null
+  }
+}""")
 
-def base_ltp():
-    buf = bytearray(PACKET_LTP)
-    buf[0] = 1  # MODE_LTP
-    buf[1] = 1  # EXCH_NSE_CM
-    buf[2:27] = b'3045\x00' + b'\x00'*20  # token
-    # seq (8 bytes @ 27) = 1
-    struct.pack_into('<Q', buf, 27, 1)
-    # ts_ms (8 bytes @ 35) = 1710000000000
-    struct.pack_into('<q', buf, 35, 1710000000000)
-    # ltp (8 bytes @ 43) = 83050
-    struct.pack_into('<q', buf, 43, 83050)
-    return buf
+# 2. Valid Indian Quote
+write("valid_in.bin", """{
+  "chart": {
+    "result": [{
+      "meta": {
+        "currency": "INR",
+        "symbol": "RELIANCE.NS",
+        "exchangeName": "NSE",
+        "regularMarketTime": 1710001000,
+        "regularMarketPrice": 2985.75,
+        "regularMarketVolume": 8500000
+      }
+    }],
+    "error": null
+  }
+}""")
 
-# Seed 1: Minimal valid LTP
-write("ltp_valid.bin", base_ltp())
+# 3. Valid ETF
+write("valid_etf.bin", """{
+  "chart": {
+    "result": [{
+      "meta": {
+        "currency": "USD",
+        "symbol": "SPY",
+        "exchangeName": "PCX",
+        "regularMarketTime": 1710002000,
+        "regularMarketPrice": 510.25,
+        "regularMarketVolume": 70000000
+      }
+    }],
+    "error": null
+  }
+}""")
 
-# Seed 2: LTP length exactly PACKET_LTP - 1 (must return false)
-b = base_ltp()[:PACKET_LTP-1]
-write("ltp_short_by_1.bin", b)
+# 4. Error response
+write("error_not_found.bin", """{
+  "chart": {
+    "result": null,
+    "error": {
+      "code": "Not Found",
+      "description": "No data found for symbol"
+    }
+  }
+}""")
 
-# Seed 3: Mode = 0 (invalid) — should return false
-buf = bytearray(PACKET_LTP)
-buf[0] = 0
-write("mode_zero.bin", buf)
+# 5. Missing price
+write("missing_price.bin", """{
+  "chart": {
+    "result": [{
+      "meta": {
+        "symbol": "AAPL",
+        "regularMarketVolume": 10000
+      }
+    }]
+  }
+}""")
 
-# Seed 4: Mode = 4 (depth, not supported) — should return false
-buf = bytearray(PACKET_LTP)
-buf[0] = 4
-write("mode_depth.bin", buf)
+# 6. Missing symbol
+write("missing_symbol.bin", """{
+  "chart": {
+    "result": [{
+      "meta": {
+        "regularMarketPrice": 150.00,
+        "regularMarketVolume": 10000
+      }
+    }]
+  }
+}""")
 
-# Seed 5: Mode = 0xFF — should return false
-buf = bytearray(PACKET_LTP)
-buf[0] = 0xFF
-write("mode_ff.bin", buf)
+# 7. Truncated JSON
+write("truncated.bin", """{"chart": {"result": [{"meta": {"symbol": "AAPL", "regularMarketPrice": 18""")
 
-# Seed 6: Token field = all 9s (25 bytes), no null terminator
-buf = base_ltp()
-buf[2:27] = b'9' * 25
-write("token_all_nines.bin", buf)
-
-# Seed 7: Token = 10 digits (should truncate at 9)
-buf = base_ltp()
-buf[2:27] = b'1234567890\x00' + b'\x00'*14
-write("token_10digits.bin", buf)
-
-# Seed 8: Negative timestamp
-buf = base_ltp()
-struct.pack_into('<q', buf, 35, -1)
-write("ts_negative.bin", buf)
-
-# Seed 9: INT64_MAX timestamp
-buf = base_ltp()
-struct.pack_into('<q', buf, 35, (1 << 63) - 1)
-write("ts_max.bin", buf)
-
-# Seed 10: INT64_MIN timestamp
-buf = base_ltp()
-struct.pack_into('<q', buf, 35, -(1 << 63))
-write("ts_min.bin", buf)
-
-# Seed 11: Quote mode, exactly PACKET_QUOTE bytes
-buf = bytearray(PACKET_QUOTE)
-buf[0] = 2  # MODE_QUOTE
-buf[1] = 1
-buf[2:27] = b'3045\x00' + b'\x00'*20
-struct.pack_into('<Q', buf, 27, 1)
-struct.pack_into('<q', buf, 35, 1710000000000)
-struct.pack_into('<q', buf, 43, 83050)
-struct.pack_into('<Q', buf, 51, 100)   # last_qty
-struct.pack_into('<Q', buf, 67, 50000) # volume
-write("quote_valid.bin", buf)
-
-# Seed 12: Quote mode, PACKET_QUOTE - 1 (must fail)
-write("quote_short.bin", bytes(buf[:PACKET_QUOTE-1]))
-
-# Seed 13: SnapQuote mode, minimum valid
-buf = bytearray(PACKET_SNAP_QUOTE)
-buf[0] = 3  # MODE_SNAP_QUOTE
-buf[1] = 1
-buf[2:27] = b'3045\x00' + b'\x00'*20
-struct.pack_into('<Q', buf, 27, 2)
-struct.pack_into('<q', buf, 35, 1710000000000)
-struct.pack_into('<q', buf, 43, 83050)
-struct.pack_into('<Q', buf, 51, 100)
-struct.pack_into('<Q', buf, 67, 50000)
-struct.pack_into('<Q', buf, 149, 500)   # best_bid_qty
-struct.pack_into('<q', buf, 157, 83045) # best_bid_price
-struct.pack_into('<Q', buf, 249, 600)   # best_ask_qty
-struct.pack_into('<q', buf, 257, 83055) # best_ask_price
-write("snap_valid.bin", buf)
-
-# Seed 14: SnapQuote mode, PACKET_SNAP_QUOTE - 1 (must fail)
-write("snap_short.bin", bytes(buf[:PACKET_SNAP_QUOTE-1]))
-
-# Seed 15: Unknown exchange type
-buf = base_ltp()
-buf[1] = 99
-write("unknown_exchange.bin", buf)
-
-# Seed 16: Empty input
+# 8. Empty input
 write("empty.bin", b"")
 
-# Seed 17: Single byte
-write("one_byte.bin", b"\x01")
+# 9. Single byte
+write("one_byte.bin", b"{")
 
-# Seed 18: All zeros, LTP size
-write("all_zeros_ltp.bin", bytes(PACKET_LTP))
+# 10. Minimal object
+write("two_bytes.bin", b"{}")
 
-# Seed 19: All 0xFF
-write("all_ff.bin", bytes([0xFF] * PACKET_LTP))
+# 11. Negative price
+write("negative_price.bin", """{
+  "chart": {
+    "result": [{
+      "meta": {
+        "symbol": "AAPL",
+        "regularMarketPrice": -150.25
+      }
+    }]
+  }
+}""")
+
+# 12. Zero price
+write("zero_price.bin", """{
+  "chart": {
+    "result": [{
+      "meta": {
+        "symbol": "AAPL",
+        "regularMarketPrice": 0.0
+      }
+    }]
+  }
+}""")
+
+# 13. Deeply nested
+write("deep_nested.bin", "[" * 50 + '{"chart":{"result":[{"meta":{"symbol":"AAPL","regularMarketPrice":100}}]}}' + "]" * 50)
+
+# 14. Non-numeric price
+write("invalid_price.bin", """{
+  "chart": {
+    "result": [{
+      "meta": {
+        "symbol": "AAPL",
+        "regularMarketPrice": "abc"
+      }
+    }]
+  }
+}""")
+
+# 15. Binary garbage
+write("binary_garbage.bin", bytes(range(256)))
+
+# 16. Very long symbol
+write("long_symbol.bin", """{
+  "chart": {
+    "result": [{
+      "meta": {
+        "symbol": \"""" + "A" * 200 + """",
+        "regularMarketPrice": 100.0
+      }
+    }]
+  }
+}""")
+
+# 17. Null meta
+write("null_meta.bin", """{"chart": {"result": [{"meta": null}]}}""")
+
+# 18. Large volume
+write("large_volume.bin", """{
+  "chart": {
+    "result": [{
+      "meta": {
+        "symbol": "AAPL",
+        "regularMarketPrice": 100.0,
+        "regularMarketVolume": 999999999999999
+      }
+    }]
+  }
+}""")
+
+# 19. All whitespace
+write("whitespace.bin", "   \t\r\n   ")
+
+# 20. Escape sequences
+write("escapes.bin", """{
+  "chart": {
+    "result": [{
+      "meta": {
+        "symbol": "A\\\"A\\nP\\tL",
+        "regularMarketPrice": 100.5
+      }
+    }]
+  }
+}""")
 
 print(f"Generated {len(list(OUT.glob('*.bin')))} seed files in {OUT}")

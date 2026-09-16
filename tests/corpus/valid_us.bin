@@ -1,0 +1,16 @@
+{
+  "chart": {
+    "result": [{
+      "meta": {
+        "currency": "USD",
+        "symbol": "AAPL",
+        "exchangeName": "NMS",
+        "instrumentType": "EQUITY",
+        "regularMarketTime": 1710000000,
+        "regularMarketPrice": 185.50,
+        "regularMarketVolume": 45000000
+      }
+    }],
+    "error": null
+  }
+}

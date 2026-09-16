@@ -1,4 +1,4 @@
-// market_data_benchmark.cpp — Angel One decoder and SPSC market-data throughput/latency benchmark.
+// market_data_benchmark.cpp — Market data parser, SPSC queue, and binary logging benchmark.
 //
 // Methodology:
 //   Throughput : uninstrumented bulk loop (total_ops / wall_clock_seconds).
@@ -19,7 +19,6 @@
 #include <new>
 
 using namespace hft;
-using namespace hft::broker;
 
 // ============================================================================
 // 1. Memory Allocation Tracker
@@ -60,16 +59,6 @@ void operator delete(void* p, size_t) noexcept {
     std::free(p);
 }
 
-void* operator new[](size_t size) {
-    if (g_track_allocations) {
-        ++g_alloc_stats.alloc_count;
-        g_alloc_stats.bytes_allocated += size;
-    }
-    void* p = std::malloc(size);
-    if (!p) throw std::bad_alloc();
-    return p;
-}
-
 void operator delete[](void* p) noexcept {
     if (g_track_allocations && p) ++g_alloc_stats.dealloc_count;
     std::free(p);
@@ -84,13 +73,20 @@ void operator delete[](void* p, size_t) noexcept {
 // 2. Main benchmark
 // ============================================================================
 
+static const std::string g_sample_quotes[] = {
+    R"({"chart":{"result":[{"meta":{"symbol":"AAPL","regularMarketPrice":185.50,"regularMarketVolume":45000000,"exchangeName":"NMS","regularMarketTime":1710000000}}]}})",
+    R"({"chart":{"result":[{"meta":{"symbol":"MSFT","regularMarketPrice":420.25,"regularMarketVolume":22000000,"exchangeName":"NMS","regularMarketTime":1710000005}}]}})",
+    R"({"chart":{"result":[{"meta":{"symbol":"RELIANCE.NS","regularMarketPrice":2980.10,"regularMarketVolume":8500000,"exchangeName":"NSE","regularMarketTime":1710000010}}]}})",
+    R"({"chart":{"result":[{"meta":{"symbol":"GOOGL","regularMarketPrice":175.80,"regularMarketVolume":18000000,"exchangeName":"NMS","regularMarketTime":1710000015}}]}})"
+};
+
 int main() {
     BenchTimer timer;
     timer.calibrate(3, 50);
 
     std::cout << "=======================================================================================================\n";
-    std::cout << " LOW-LATENCY C++ — MARKET DATA DECODER & SPSC BENCHMARK\n";
-    std::cout << " Protocol: Angel One SmartStream Binary | MarketEvent: 128 bytes (2 cache lines)\n";
+    std::cout << " LOW-LATENCY C++ — MARKET DATA PARSER & SPSC BENCHMARK\n";
+    std::cout << " Adapter: Yahoo Finance JSON Parser | MarketEvent: 128 bytes (2 cache lines)\n";
     std::cout << "=======================================================================================================\n\n";
     std::cout << "Timer: TSC (empirical calibration) — " << std::fixed << std::setprecision(3)
               << timer.tsc_ghz() << " GHz\n";
@@ -103,16 +99,12 @@ int main() {
     std::cout << ">>> HOT-PATH ALLOCATION VERIFICATION <<<\n";
     {
         constexpr size_t VERIFY_N = 50000;
-        uint8_t packet[AngelConstants::PACKET_SIZE_SNAP_QUOTE]{0};
-        MockAngelFeed::build_snap_quote_packet(
-            packet, sizeof(packet), "3045", 83050, 100, 83045, 500, 83055, 600, 1, 1710000000000LL, 10000);
-
         hft::MarketEvent ev{};
         hft::SpscQueue<hft::MarketEvent, 1024> queue;
 
         // Warmup
         for (size_t i = 0; i < 1000; ++i) {
-            AngelDecoder::decode(packet, sizeof(packet), ev, i);
+            YahooParser::parse(g_sample_quotes[i % 4], ev, i);
             queue.try_push(ev);
             queue.try_pop(ev);
         }
@@ -120,13 +112,13 @@ int main() {
         g_alloc_stats.reset();
         g_track_allocations = true;
         for (size_t i = 0; i < VERIFY_N; ++i) {
-            AngelDecoder::decode(packet, sizeof(packet), ev, i);
+            YahooParser::parse(g_sample_quotes[i % 4], ev, i);
             queue.try_push(ev);
             queue.try_pop(ev);
         }
         g_track_allocations = false;
 
-        std::cout << "  Decode + SPSC push/pop (" << VERIFY_N << " ops): "
+        std::cout << "  Parse + SPSC push/pop (" << VERIFY_N << " ops): "
                   << g_alloc_stats.alloc_count << " heap allocations\n";
         if (g_alloc_stats.alloc_count == 0) {
             std::cout << "  RESULT: VERIFIED ZERO DYNAMIC ALLOCATIONS\n\n";
@@ -139,44 +131,43 @@ int main() {
     // Per-scale benchmarks
     // -------------------------------------------------------------------------
     for (size_t count : {size_t{100000}, size_t{1000000}}) {
-        std::cout << "=== SCALE: " << count << " packets ===\n";
+        std::cout << "=== SCALE: " << count << " events ===\n";
 
-        auto packets = MockAngelFeed::generate_synthetic_stream(count, 0xABCDEFULL);
         std::vector<hft::MarketEvent> events(count);
 
-        // -- A: Decoder throughput (bulk, uninstrumented) ---------------------
+        // -- A: Parser throughput (bulk, uninstrumented) ----------------------
         {
             // Warmup
             for (size_t i = 0; i < std::min(count / 10, size_t{5000}); ++i) {
-                AngelDecoder::decode(packets[i].data(), packets[i].size(), events[i], i);
+                YahooParser::parse(g_sample_quotes[i % 4], events[i], i);
             }
 
             auto t0 = std::chrono::steady_clock::now();
             for (size_t i = 0; i < count; ++i) {
-                AngelDecoder::decode(packets[i].data(), packets[i].size(), events[i], i);
+                YahooParser::parse(g_sample_quotes[i % 4], events[i], i);
             }
             auto t1 = std::chrono::steady_clock::now();
             double sec = std::chrono::duration<double>(t1 - t0).count();
-            std::cout << "  [A] Decoder throughput: "
+            std::cout << "  [A] Parser throughput: "
                       << std::fixed << std::setprecision(2) << (count / sec / 1e6) << " M pkts/s\n";
         }
 
-        // -- A: Decoder latency (per-op TSC, same samples for all stats) ------
+        // -- A: Parser latency (per-op TSC, same samples for all stats) -------
         {
             const size_t N = std::min(count, size_t{100000});
             LatencySampler sampler(N);
 
             // Warmup
             for (size_t i = 0; i < std::min(N / 10, size_t{500}); ++i) {
-                AngelDecoder::decode(packets[i].data(), packets[i].size(), events[i], i);
+                YahooParser::parse(g_sample_quotes[i % 4], events[i], i);
             }
             for (size_t i = 0; i < N; ++i) {
                 auto t0 = timer.start();
-                AngelDecoder::decode(packets[i].data(), packets[i].size(), events[i], i);
+                YahooParser::parse(g_sample_quotes[i % 4], events[i], i);
                 sampler.record(timer.stop_ns(t0));
             }
             sampler.finish();
-            sampler.print_summary("Decoder latency (TSC, per-op samples):");
+            sampler.print_summary("Parser latency (TSC, per-op samples):");
         }
 
         // -- B: SPSC push+pop throughput & latency ----------------------------

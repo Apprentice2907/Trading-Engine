@@ -8,36 +8,11 @@
 #include <chrono>
 
 using namespace hft;
-using namespace hft::broker;
 
 namespace {
 
 std::vector<MarketEvent> generate_deterministic_market_events(size_t count, uint64_t seed = 0x12345678ULL) {
-    std::vector<MarketEvent> events;
-    events.reserve(count);
-    uint64_t state = seed;
-    auto next_u64 = [&state]() -> uint64_t {
-        state = state * 6364136223846793005ULL + 1ULL;
-        return state >> 32;
-    };
-    for (size_t i = 0; i < count; ++i) {
-        MarketEvent ev{};
-        ev.instrument_token = 3045;
-        ev.exchange_type = 1;
-        ev.subscription_mode = 3;
-        ev.sequence_number = i + 1;
-        ev.exchange_timestamp = 1710000000000ULL + i * 1000000ULL;
-        ev.receive_timestamp = 1000000000ULL + i * 50ULL;
-        ev.last_price = 83000 + static_cast<int64_t>(next_u64() % 100);
-        ev.last_quantity = 50 + (next_u64() % 20);
-        ev.best_bid_price = ev.last_price - 5;
-        ev.best_bid_quantity = 200;
-        ev.best_ask_price = ev.last_price + 5;
-        ev.best_ask_quantity = 300;
-        ev.volume = 10000 + i * 10;
-        events.push_back(ev);
-    }
-    return events;
+    return MockMarketDataSource::generate_events(count, 3045, seed);
 }
 
 } // namespace
@@ -54,120 +29,188 @@ TEST_CASE(MarketEvent_LayoutAndAlignment) {
 }
 
 // ============================================================================
-// 2. Broker Wire Protocol Decoders (LTP, Quote, SnapQuote)
+// 2. Yahoo Finance Market Data Parser & Mock Provider Tests
 // ============================================================================
 
-TEST_CASE(AngelDecoder_LtpMode51Bytes) {
-    uint8_t buffer[64]{0};
-    size_t len = MockAngelFeed::build_ltp_packet(buffer, sizeof(buffer), "3045", 83050, 101, 1710000000123LL, AngelConstants::EXCH_NSE_CM);
-    ASSERT_EQ(len, 51);
+TEST_CASE(YahooParser_ValidUSQuote) {
+    const std::string json = R"({
+        "chart": {
+            "result": [{
+                "meta": {
+                    "currency": "USD",
+                    "symbol": "AAPL",
+                    "exchangeName": "NMS",
+                    "instrumentType": "EQUITY",
+                    "regularMarketTime": 1710000000,
+                    "regularMarketPrice": 185.50,
+                    "regularMarketVolume": 45000000
+                }
+            }],
+            "error": null
+        }
+    })";
 
     MarketEvent ev{};
     uint64_t recv_ts = 987654321ULL;
-    bool ok = AngelDecoder::decode(buffer, len, ev, recv_ts);
+    bool ok = YahooParser::parse(json, ev, recv_ts);
 
     ASSERT_TRUE(ok);
-    ASSERT_EQ(ev.instrument_token, 3045u);
-    ASSERT_EQ(ev.exchange_type, AngelConstants::EXCH_NSE_CM);
-    ASSERT_EQ(ev.subscription_mode, AngelConstants::MODE_LTP);
-    ASSERT_EQ(ev.sequence_number, 101);
-    ASSERT_EQ(ev.exchange_timestamp, 1710000000123000000ULL);
+    ASSERT_EQ(ev.instrument_token, YahooParser::symbol_hash("AAPL"));
+    ASSERT_EQ(ev.exchange_type, 2); // NMS/US
+    ASSERT_EQ(ev.subscription_mode, 1);
+    ASSERT_EQ(ev.sequence_number, 1);
+    ASSERT_EQ(ev.exchange_timestamp, 1710000000ULL * 1000000000ULL);
     ASSERT_EQ(ev.receive_timestamp, recv_ts);
-    ASSERT_EQ(ev.last_price, 83050);
+    ASSERT_EQ(ev.last_price, 18550); // 185.50 * 100
+    ASSERT_EQ(ev.volume, 45000000);
+    // Explicitly check zero-bid/ask / no fabrication
     ASSERT_EQ(ev.last_quantity, 0);
+    ASSERT_EQ(ev.best_bid_price, 0);
+    ASSERT_EQ(ev.best_bid_quantity, 0);
+    ASSERT_EQ(ev.best_ask_price, 0);
+    ASSERT_EQ(ev.best_ask_quantity, 0);
+    // Verify symbol in reserved field
+    ASSERT_TRUE(std::string_view(reinterpret_cast<const char*>(ev.reserved)).find("AAPL") != std::string_view::npos);
+}
+
+TEST_CASE(YahooParser_ValidIndianQuote) {
+    const std::string json = R"({
+        "chart": {
+            "result": [{
+                "meta": {
+                    "currency": "INR",
+                    "symbol": "RELIANCE.NS",
+                    "exchangeName": "NSE",
+                    "regularMarketTime": 1710001000,
+                    "regularMarketPrice": 2985.75,
+                    "regularMarketVolume": 8500000
+                }
+            }],
+            "error": null
+        }
+    })";
+
+    MarketEvent ev{};
+    bool ok = YahooParser::parse(json, ev, 11223344ULL);
+
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(ev.instrument_token, YahooParser::symbol_hash("RELIANCE.NS"));
+    ASSERT_EQ(ev.exchange_type, 1); // NSE/India
+    ASSERT_EQ(ev.last_price, 298575); // 2985.75 * 100
+    ASSERT_EQ(ev.volume, 8500000);
     ASSERT_EQ(ev.best_bid_price, 0);
     ASSERT_EQ(ev.best_ask_price, 0);
 }
 
-TEST_CASE(AngelDecoder_QuoteMode147Bytes) {
-    uint8_t buffer[200]{0};
-    size_t len = MockAngelFeed::build_quote_packet(
-        buffer, sizeof(buffer), "26009", 2245000, 50, 502, 1710000000500LL, 150000,
-        2240000, 2250000, 2235000, 2242000, AngelConstants::EXCH_NSE_CM);
-    ASSERT_EQ(len, 147);
+TEST_CASE(YahooParser_MissingPrice) {
+    const std::string json = R"({
+        "chart": {
+            "result": [{
+                "meta": {
+                    "symbol": "AAPL",
+                    "regularMarketVolume": 10000
+                }
+            }]
+        }
+    })";
 
     MarketEvent ev{};
-    uint64_t recv_ts = 11223344ULL;
-    bool ok = AngelDecoder::decode(buffer, len, ev, recv_ts);
+    ASSERT_FALSE(YahooParser::parse(json, ev, 0));
+}
 
-    ASSERT_TRUE(ok);
-    ASSERT_EQ(ev.instrument_token, 26009u);
-    ASSERT_EQ(ev.subscription_mode, AngelConstants::MODE_QUOTE);
-    ASSERT_EQ(ev.sequence_number, 502);
-    ASSERT_EQ(ev.exchange_timestamp, 1710000000500000000ULL);
-    ASSERT_EQ(ev.receive_timestamp, recv_ts);
-    ASSERT_EQ(ev.last_price, 2245000);
-    ASSERT_EQ(ev.last_quantity, 50);
-    ASSERT_EQ(ev.volume, 150000);
+TEST_CASE(YahooParser_MissingSymbol) {
+    const std::string json = R"({
+        "chart": {
+            "result": [{
+                "meta": {
+                    "regularMarketPrice": 150.00,
+                    "regularMarketVolume": 10000
+                }
+            }]
+        }
+    })";
+
+    MarketEvent ev{};
+    ASSERT_FALSE(YahooParser::parse(json, ev, 0));
+}
+
+TEST_CASE(YahooParser_InvalidNumeric) {
+    const std::string json = R"({
+        "chart": {
+            "result": [{
+                "meta": {
+                    "symbol": "AAPL",
+                    "regularMarketPrice": "NOT_A_NUMBER"
+                }
+            }]
+        }
+    })";
+
+    MarketEvent ev{};
+    ASSERT_FALSE(YahooParser::parse(json, ev, 0));
+}
+
+TEST_CASE(YahooParser_MalformedJson) {
+    MarketEvent ev{};
+    ASSERT_FALSE(YahooParser::parse("", ev, 0));
+    ASSERT_FALSE(YahooParser::parse("   ", ev, 0));
+    ASSERT_FALSE(YahooParser::parse("{\"chart\": { truncated...", ev, 0));
+    ASSERT_FALSE(YahooParser::parse("random non-json garbage data", ev, 0));
+}
+
+TEST_CASE(YahooParser_ErrorResponse) {
+    const std::string json = R"({
+        "chart": {
+            "result": null,
+            "error": {
+                "code": "Not Found",
+                "description": "No data found for symbol XYZ"
+            }
+        }
+    })";
+
+    MarketEvent ev{};
+    ASSERT_FALSE(YahooParser::parse(json, ev, 0));
+}
+
+TEST_CASE(YahooParser_ZeroBidAskEnforcement) {
+    const std::string json = R"({
+        "chart": {
+            "result": [{
+                "meta": {
+                    "symbol": "MSFT",
+                    "regularMarketPrice": 420.10,
+                    "regularMarketVolume": 123456
+                }
+            }]
+        }
+    })";
+
+    MarketEvent ev{};
+    ASSERT_TRUE(YahooParser::parse(json, ev, 12345));
     ASSERT_EQ(ev.best_bid_price, 0);
+    ASSERT_EQ(ev.best_bid_quantity, 0);
+    ASSERT_EQ(ev.best_ask_price, 0);
+    ASSERT_EQ(ev.best_ask_quantity, 0);
+    ASSERT_EQ(ev.last_quantity, 0);
 }
 
-TEST_CASE(AngelDecoder_SnapQuoteMode347Bytes) {
-    uint8_t buffer[400]{0};
-    size_t len = MockAngelFeed::build_snap_quote_packet(
-        buffer, sizeof(buffer), "3045", 83050, 100, 83045, 500, 83055, 600, 999, 1710000000999LL, 75000);
-    ASSERT_EQ(len, 347);
+TEST_CASE(MockMarketDataSource_DeterministicGeneration) {
+    auto events = MockMarketDataSource::generate_events(500, 3045, 0xABCDEFULL);
+    ASSERT_EQ(events.size(), 500u);
 
-    MarketEvent ev{};
-    uint64_t recv_ts = 55667788ULL;
-    bool ok = AngelDecoder::decode(buffer, len, ev, recv_ts);
-
-    ASSERT_TRUE(ok);
-    ASSERT_EQ(ev.instrument_token, 3045u);
-    ASSERT_EQ(ev.subscription_mode, AngelConstants::MODE_SNAP_QUOTE);
-    ASSERT_EQ(ev.last_price, 83050);
-    ASSERT_EQ(ev.last_quantity, 100);
-    ASSERT_EQ(ev.best_bid_price, 83045);
-    ASSERT_EQ(ev.best_bid_quantity, 500);
-    ASSERT_EQ(ev.best_ask_price, 83055);
-    ASSERT_EQ(ev.best_ask_quantity, 600);
-    ASSERT_EQ(ev.volume, 75000);
-}
-
-TEST_CASE(AngelDecoder_TokenParsing) {
-    ASSERT_EQ(AngelDecoder::parse_token("3045"), 3045u);
-    ASSERT_EQ(AngelDecoder::parse_token("26009"), 26009u);
-    ASSERT_EQ(AngelDecoder::parse_token("0"), 0u);
-    ASSERT_EQ(AngelDecoder::parse_token("11536\0trailing"), 11536u);
-    ASSERT_EQ(AngelDecoder::parse_token("INVALID"), 0u);
-}
-
-TEST_CASE(AngelDecoder_PriceAndQuantityConversion) {
-    uint8_t buffer[64]{0};
-    MockAngelFeed::build_ltp_packet(buffer, sizeof(buffer), "100", 12345678, 1, 1000);
-
-    MarketEvent ev{};
-    ASSERT_TRUE(AngelDecoder::decode(buffer, 51, ev, 123));
-    ASSERT_EQ(ev.last_price, 12345678);
-}
-
-TEST_CASE(AngelDecoder_TimestampConversion) {
-    uint8_t buffer[64]{0};
-    int64_t test_ms = 1672531199000LL;
-    MockAngelFeed::build_ltp_packet(buffer, sizeof(buffer), "1", 100, 1, test_ms);
-
-    MarketEvent ev{};
-    uint64_t local_now = 999888777ULL;
-    ASSERT_TRUE(AngelDecoder::decode(buffer, 51, ev, local_now));
-    ASSERT_EQ(ev.exchange_timestamp, static_cast<uint64_t>(test_ms) * 1000000ULL);
-    ASSERT_EQ(ev.receive_timestamp, local_now);
-}
-
-TEST_CASE(AngelDecoder_MalformedPacketRejection) {
-    uint8_t buffer[200]{0};
-    MarketEvent ev{};
-
-    ASSERT_FALSE(AngelDecoder::decode(nullptr, 51, ev, 0));
-    ASSERT_FALSE(AngelDecoder::decode(buffer, 50, ev, 0));
-
-    buffer[0] = AngelConstants::MODE_QUOTE;
-    ASSERT_FALSE(AngelDecoder::decode(buffer, 51, ev, 0));
-
-    buffer[0] = AngelConstants::MODE_SNAP_QUOTE;
-    ASSERT_FALSE(AngelDecoder::decode(buffer, 147, ev, 0));
-
-    buffer[0] = 99;
-    ASSERT_FALSE(AngelDecoder::decode(buffer, 51, ev, 0));
+    for (size_t i = 0; i < events.size(); ++i) {
+        ASSERT_EQ(events[i].instrument_token, 3045u);
+        ASSERT_EQ(events[i].sequence_number, i + 1);
+        ASSERT_TRUE(events[i].last_price > 0);
+        ASSERT_TRUE(events[i].best_bid_price < events[i].best_ask_price);
+        ASSERT_TRUE(events[i].best_bid_quantity > 0);
+        ASSERT_TRUE(events[i].best_ask_quantity > 0);
+        if (i > 0) {
+            ASSERT_TRUE(events[i].exchange_timestamp >= events[i - 1].exchange_timestamp);
+            ASSERT_TRUE(events[i].receive_timestamp >= events[i - 1].receive_timestamp);
+        }
+    }
 }
 
 // ============================================================================
