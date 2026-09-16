@@ -33,8 +33,20 @@ bool find_json_key(std::string_view json, std::string_view key, std::string_view
         // Check if preceded and followed by double quotes: "key"
         if (pos > 0 && json[pos - 1] == '"' && (pos + key.size()) < json.size() && json[pos + key.size()] == '"') {
             size_t val_pos = pos + key.size() + 1; // position immediately after closing quote
+            // Must see optional whitespace, then a colon ':'
             while (val_pos < json.size() && (json[val_pos] == ' ' || json[val_pos] == '\t' ||
-                   json[val_pos] == '\r' || json[val_pos] == '\n' || json[val_pos] == ':')) {
+                   json[val_pos] == '\r' || json[val_pos] == '\n')) {
+                ++val_pos;
+            }
+            if (val_pos >= json.size() || json[val_pos] != ':') {
+                search_pos = pos + 1;
+                continue;
+            }
+            ++val_pos; // advance past ':'
+
+            // Skip whitespace after colon
+            while (val_pos < json.size() && (json[val_pos] == ' ' || json[val_pos] == '\t' ||
+                   json[val_pos] == '\r' || json[val_pos] == '\n')) {
                 ++val_pos;
             }
             if (val_pos >= json.size()) return false;
@@ -106,7 +118,8 @@ bool parse_int64_fast(std::string_view s, int64_t& out) noexcept {
 // ============================================================================
 
 uint32_t YahooParser::symbol_hash(std::string_view sym) noexcept {
-    return crc32(0, sym.data(), sym.size()) & 0x7FFFFFFFU;
+    uint32_t h = crc32(0, sym.data(), sym.size()) & 0x7FFFFFFFU;
+    return (h != 0) ? h : 1u;
 }
 
 bool YahooParser::parse(std::string_view json, MarketEvent& out_event, uint64_t receive_ts_ns) noexcept {
@@ -123,6 +136,9 @@ bool YahooParser::parse(std::string_view json, MarketEvent& out_event, uint64_t 
     if (!find_json_key(json, "symbol", symbol) || symbol.empty()) {
         return false;
     }
+    if (!std::isalnum(static_cast<unsigned char>(symbol[0]))) {
+        return false;
+    }
 
     // 2. Regular Market Price (Required)
     std::string_view price_str;
@@ -132,6 +148,10 @@ bool YahooParser::parse(std::string_view json, MarketEvent& out_event, uint64_t 
     double price_val = 0.0;
     constexpr double MAX_REPRESENTABLE_PRICE = 90000000000000.0; // 90 trillion
     if (!parse_double_fast(price_str, price_val) || price_val <= 0.0 || price_val > MAX_REPRESENTABLE_PRICE) {
+        return false;
+    }
+    int64_t price_ticks = static_cast<int64_t>(std::round(price_val * 100.0));
+    if (price_ticks <= 0) {
         return false;
     }
 
@@ -183,7 +203,7 @@ bool YahooParser::parse(std::string_view json, MarketEvent& out_event, uint64_t 
     out_event.sequence_number = 1;
     out_event.exchange_timestamp = (time_sec > 0) ? static_cast<uint64_t>(time_sec) * 1000000000ULL : 0ULL;
     out_event.receive_timestamp = now_ns;
-    out_event.last_price = static_cast<int64_t>(std::round(price_val * 100.0));
+    out_event.last_price = price_ticks;
     out_event.last_quantity = 0;      // Not provided in basic chart feed; do not fabricate
     out_event.best_bid_price = 0;     // Not provided in basic chart feed; do not fabricate
     out_event.best_bid_quantity = 0;  // Not provided in basic chart feed; do not fabricate
