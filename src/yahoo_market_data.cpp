@@ -130,7 +130,8 @@ bool YahooParser::parse(std::string_view json, MarketEvent& out_event, uint64_t 
         return false;
     }
     double price_val = 0.0;
-    if (!parse_double_fast(price_str, price_val) || price_val <= 0.0) {
+    constexpr double MAX_REPRESENTABLE_PRICE = 90000000000000.0; // 90 trillion
+    if (!parse_double_fast(price_str, price_val) || price_val <= 0.0 || price_val > MAX_REPRESENTABLE_PRICE) {
         return false;
     }
 
@@ -139,6 +140,10 @@ bool YahooParser::parse(std::string_view json, MarketEvent& out_event, uint64_t 
     std::string_view time_str;
     if (find_json_key(json, "regularMarketTime", time_str)) {
         (void)parse_int64_fast(time_str, time_sec);
+    }
+    // Cap timestamp to prevent nanosecond multiplication overflow
+    if (time_sec < 0 || time_sec > 9000000000LL) {
+        time_sec = 0;
     }
 
     // 4. Volume (Optional, default to 0)
