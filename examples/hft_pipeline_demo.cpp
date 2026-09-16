@@ -211,6 +211,7 @@ int run_integrated_demo(bool mock_mode, uint32_t token, uint32_t duration_sec) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
     } else {
+#ifdef _WIN32
         auto config = hft::broker::AngelClient::load_config_from_env();
         if (config.api_key.empty() || config.client_code.empty() || config.feed_token.empty()) {
             std::cerr << "\n[Error] Angel One credentials missing in environment!\n";
@@ -260,6 +261,14 @@ int run_integrated_demo(bool mock_mode, uint32_t token, uint32_t duration_sec) {
         client.stop();
         if (net_thread.joinable()) net_thread.join();
         client.disconnect();
+#else
+        (void)token;
+        (void)duration_sec;
+        (void)start_time;
+        std::cerr << "\n[Notice] Angel One live WebSocket provider is only available on Windows (WinHTTP).\n";
+        std::cerr << "Run with '--mock' to test the integrated pipeline offline on Linux.\n";
+        return 1;
+#endif
     }
 
     md_pipeline.stop_and_join();

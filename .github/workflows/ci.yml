@@ -43,18 +43,11 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Configure (Windows)
         if: runner.os == 'Windows'
-        run: |
-          cmake -S . -B build ^
-            -G "${{ matrix.cmake_generator }}" ${{ matrix.cmake_arch }} ^
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
-        shell: cmd
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 
       - name: Configure (Linux)
         if: runner.os == 'Linux'
-        run: |
-          cmake -S . -B build \
-            -G "${{ matrix.cmake_generator }}" \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+        run: cmake -S . -B build -G "${{ matrix.cmake_generator }}" -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
 
       # -----------------------------------------------------------------------
       # Build

@@ -85,6 +85,7 @@ int cmd_live(bool mock_mode, uint32_t token, uint32_t duration_sec = 0) {
         }
         std::cout << "\n";
     } else {
+#ifdef _WIN32
         auto config = hft::broker::AngelClient::load_config_from_env();
         if (token != 0) config.instrument_token = token;
 
@@ -158,6 +159,14 @@ int cmd_live(bool mock_mode, uint32_t token, uint32_t duration_sec = 0) {
         if (net_thread.joinable()) net_thread.join();
         client.disconnect();
         std::cout << "\nDisconnected.\n";
+#else
+        (void)token;
+        (void)duration_sec;
+        (void)stream_start;
+        std::cerr << "\n[Notice] Angel One live WebSocket provider is only available on Windows (WinHTTP).\n";
+        std::cerr << "Run with '--mock' to stream or record market data offline on Linux.\n";
+        return 1;
+#endif
     }
 
     pipeline.stop_and_join();
