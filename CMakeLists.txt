@@ -31,7 +31,15 @@ set(HFT_CORE_SOURCES
     src/trading_pipeline.cpp
 )
 
+if (WIN32)
+    list(APPEND HFT_CORE_SOURCES src/angel_client.cpp)
+endif()
+
 add_library(hft_core STATIC ${HFT_CORE_SOURCES})
+
+if (WIN32)
+    target_link_libraries(hft_core PUBLIC winhttp)
+endif()
 
 target_include_directories(hft_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

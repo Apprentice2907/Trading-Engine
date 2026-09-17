@@ -134,6 +134,253 @@ void ReplayMarketDataSource::worker_loop() {
 }
 
 // ============================================================================
+// Angel One SmartStream Decoder & Mock Implementation
+// ============================================================================
+
+namespace broker {
+
+uint32_t AngelDecoder::parse_token(const char* token_bytes, size_t max_len) noexcept {
+    // Parse at most 9 decimal digits to prevent uint32_t overflow.
+    // 10 digits of all-9s = 9,999,999,999 which exceeds UINT32_MAX (4,294,967,295).
+    // 9 digits max = 999,999,999 which is always safe.
+    static constexpr size_t MAX_SAFE_DIGITS = 9;
+    uint32_t token = 0;
+    size_t digits = 0;
+    for (size_t i = 0; i < max_len && token_bytes[i] != '\0'; ++i) {
+        char c = token_bytes[i];
+        if (c >= '0' && c <= '9') {
+            if (digits >= MAX_SAFE_DIGITS) break; // truncate silently, avoids overflow
+            token = token * 10u + static_cast<uint32_t>(c - '0');
+            ++digits;
+        }
+    }
+    return token;
+}
+
+bool AngelDecoder::decode(const uint8_t* data, size_t length, MarketEvent& out_event,
+                          uint64_t receive_ts_ns) noexcept {
+    if (!data || length < AngelConstants::PACKET_SIZE_LTP) {
+        return false;
+    }
+
+    const uint8_t mode = data[0];
+    size_t required_size = 0;
+
+    switch (mode) {
+        case AngelConstants::MODE_LTP:
+            required_size = AngelConstants::PACKET_SIZE_LTP;
+            break;
+        case AngelConstants::MODE_QUOTE:
+            required_size = AngelConstants::PACKET_SIZE_QUOTE;
+            break;
+        case AngelConstants::MODE_SNAP_QUOTE:
+            required_size = AngelConstants::PACKET_SIZE_SNAP_QUOTE;
+            break;
+        default:
+            return false; // Unknown subscription mode
+    }
+
+    if (length < required_size) {
+        return false; // Truncated packet
+    }
+
+    // Validate exchange segment code.
+    const uint8_t exchange = data[1];
+    const uint8_t safe_exchange = (exchange == AngelConstants::EXCH_NSE_CM ||
+                                   exchange == AngelConstants::EXCH_NSE_FO ||
+                                   exchange == AngelConstants::EXCH_BSE_CM ||
+                                   exchange == AngelConstants::EXCH_BSE_FO ||
+                                   exchange == AngelConstants::EXCH_MCX_FO ||
+                                   exchange == AngelConstants::EXCH_NCX_FO ||
+                                   exchange == AngelConstants::EXCH_CDE_FO)
+                                      ? exchange : 0;
+
+    const uint32_t token      = parse_token(reinterpret_cast<const char*>(data + 2), 25);
+    const uint64_t seq        = read_u64_le(data + 27);
+    const int64_t  ts_ms      = read_i64_le(data + 35);
+    const int64_t  ltp_paise  = read_i64_le(data + 43);
+
+    // Clamp timestamp: negative timestamps are invalid; very large values are passed through.
+    const uint64_t exch_ts_ns = (ts_ms > 0)
+        ? static_cast<uint64_t>(ts_ms) * 1000000ULL
+        : 0ULL;
+
+    out_event.instrument_token  = token;
+    out_event.exchange_type     = safe_exchange;
+    out_event.subscription_mode = mode;
+    out_event.pad               = 0;
+    out_event.sequence_number   = seq;
+    out_event.exchange_timestamp = exch_ts_ns;
+    out_event.receive_timestamp  = receive_ts_ns;
+    out_event.last_price        = ltp_paise;
+    out_event.last_quantity     = 0;
+    out_event.best_bid_price    = 0;
+    out_event.best_bid_quantity = 0;
+    out_event.best_ask_price    = 0;
+    out_event.best_ask_quantity = 0;
+    out_event.volume            = 0;
+
+    if (mode == AngelConstants::MODE_QUOTE || mode == AngelConstants::MODE_SNAP_QUOTE) {
+        out_event.last_quantity = read_u64_le(data + 51);
+        out_event.volume        = read_u64_le(data + 67);
+    }
+
+    if (mode == AngelConstants::MODE_SNAP_QUOTE) {
+        out_event.best_bid_quantity = read_u64_le(data + 147 + 2);
+        out_event.best_bid_price    = read_i64_le(data + 147 + 10);
+        out_event.best_ask_quantity = read_u64_le(data + 247 + 2);
+        out_event.best_ask_price    = read_i64_le(data + 247 + 10);
+    }
+
+    return true;
+}
+
+// ============================================================================
+// MockAngelFeed Implementation
+// ============================================================================
+
+size_t MockAngelFeed::build_ltp_packet(uint8_t* out_buf, size_t buf_size,
+                                       const char* token, int64_t ltp_paise,
+                                       uint64_t seq, int64_t ts_ms,
+                                       uint8_t exchange) {
+    if (buf_size < AngelConstants::PACKET_SIZE_LTP) return 0;
+
+    std::memset(out_buf, 0, AngelConstants::PACKET_SIZE_LTP);
+    out_buf[0] = AngelConstants::MODE_LTP;
+    out_buf[1] = exchange;
+
+    size_t tok_len = std::strlen(token);
+    if (tok_len > 24) tok_len = 24;
+    std::memcpy(out_buf + 2, token, tok_len);
+
+    write_u64_le(out_buf + 27, seq);
+    write_i64_le(out_buf + 35, ts_ms);
+    write_i64_le(out_buf + 43, ltp_paise);
+
+    return AngelConstants::PACKET_SIZE_LTP;
+}
+
+size_t MockAngelFeed::build_quote_packet(uint8_t* out_buf, size_t buf_size,
+                                         const char* token, int64_t ltp_paise,
+                                         uint64_t last_qty, uint64_t seq,
+                                         int64_t ts_ms, uint64_t volume,
+                                         int64_t open, int64_t high, int64_t low, int64_t close,
+                                         uint8_t exchange) {
+    if (buf_size < AngelConstants::PACKET_SIZE_QUOTE) return 0;
+
+    std::memset(out_buf, 0, AngelConstants::PACKET_SIZE_QUOTE);
+    out_buf[0] = AngelConstants::MODE_QUOTE;
+    out_buf[1] = exchange;
+
+    size_t tok_len = std::strlen(token);
+    if (tok_len > 24) tok_len = 24;
+    std::memcpy(out_buf + 2, token, tok_len);
+
+    write_u64_le(out_buf + 27, seq);
+    write_i64_le(out_buf + 35, ts_ms);
+    write_i64_le(out_buf + 43, ltp_paise);
+
+    write_u64_le(out_buf + 51, last_qty);
+    write_i64_le(out_buf + 59, ltp_paise);
+    write_u64_le(out_buf + 67, volume);
+    write_i64_le(out_buf + 75, 5000);
+    write_i64_le(out_buf + 83, 5000);
+    write_i64_le(out_buf + 91, open);
+    write_i64_le(out_buf + 99, high);
+    write_i64_le(out_buf + 107, low);
+    write_i64_le(out_buf + 115, close);
+
+    return AngelConstants::PACKET_SIZE_QUOTE;
+}
+
+size_t MockAngelFeed::build_snap_quote_packet(uint8_t* out_buf, size_t buf_size,
+                                              const char* token, int64_t ltp_paise,
+                                              uint64_t last_qty, int64_t bid_paise,
+                                              uint64_t bid_qty, int64_t ask_paise,
+                                              uint64_t ask_qty, uint64_t seq,
+                                              int64_t ts_ms, uint64_t volume,
+                                              uint8_t exchange) {
+    if (buf_size < AngelConstants::PACKET_SIZE_SNAP_QUOTE) return 0;
+
+    std::memset(out_buf, 0, AngelConstants::PACKET_SIZE_SNAP_QUOTE);
+    out_buf[0] = AngelConstants::MODE_SNAP_QUOTE;
+    out_buf[1] = exchange;
+
+    size_t tok_len = std::strlen(token);
+    if (tok_len > 24) tok_len = 24;
+    std::memcpy(out_buf + 2, token, tok_len);
+
+    write_u64_le(out_buf + 27, seq);
+    write_i64_le(out_buf + 35, ts_ms);
+    write_i64_le(out_buf + 43, ltp_paise);
+
+    write_u64_le(out_buf + 51, last_qty);
+    write_i64_le(out_buf + 59, ltp_paise);
+    write_u64_le(out_buf + 67, volume);
+    write_i64_le(out_buf + 75, bid_qty);
+    write_i64_le(out_buf + 83, ask_qty);
+    write_i64_le(out_buf + 91, ltp_paise - 50);
+    write_i64_le(out_buf + 99, ltp_paise + 100);
+    write_i64_le(out_buf + 107, ltp_paise - 100);
+    write_i64_le(out_buf + 115, ltp_paise - 10);
+
+    out_buf[147] = 0;
+    out_buf[148] = 0;
+    write_u64_le(out_buf + 147 + 2, bid_qty);
+    write_i64_le(out_buf + 147 + 10, bid_paise);
+
+    out_buf[247] = 1;
+    out_buf[248] = 0;
+    write_u64_le(out_buf + 247 + 2, ask_qty);
+    write_i64_le(out_buf + 247 + 10, ask_paise);
+
+    return AngelConstants::PACKET_SIZE_SNAP_QUOTE;
+}
+
+std::vector<std::vector<uint8_t>> MockAngelFeed::generate_synthetic_stream(size_t count, uint64_t seed) {
+    std::vector<std::vector<uint8_t>> stream;
+    stream.reserve(count);
+
+    std::mt19937_64 rng(seed);
+    std::uniform_int_distribution<int64_t> price_delta(-25, 25);
+    std::uniform_int_distribution<uint64_t> qty_dist(10, 500);
+
+    const char* token = "3045"; // SBIN
+    int64_t base_price = 83000; // 830.00 in paise
+    int64_t ts_ms = 1710000000000LL;
+    uint64_t volume = 10000;
+
+    std::vector<uint8_t> buf(AngelConstants::PACKET_SIZE_SNAP_QUOTE);
+
+    for (size_t i = 0; i < count; ++i) {
+        base_price += price_delta(rng);
+        if (base_price < 80000) base_price = 80000;
+        if (base_price > 86000) base_price = 86000;
+
+        uint64_t qty = qty_dist(rng);
+        volume += qty;
+        ts_ms += 100;
+
+        int64_t bid_price = base_price - 5;
+        int64_t ask_price = base_price + 5;
+        uint64_t bid_qty = qty * 2;
+        uint64_t ask_qty = qty * 3;
+
+        size_t len = build_snap_quote_packet(buf.data(), buf.size(), token,
+                                             base_price, qty,
+                                             bid_price, bid_qty,
+                                             ask_price, ask_qty,
+                                             i + 1, ts_ms, volume);
+        std::vector<uint8_t> pkt(buf.data(), buf.data() + len);
+        stream.push_back(std::move(pkt));
+    }
+
+    return stream;
+}
+
+} // namespace broker
+
+// ============================================================================
 // MarketEventRecorder Implementation
 // ============================================================================
 

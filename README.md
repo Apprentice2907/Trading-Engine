@@ -146,22 +146,136 @@ Stocks/
 
 ## Performance Benchmarks
 
-*Hardware: 13th Gen Intel Core i5-13420H @ 2.10 GHz, 16 GB RAM, Windows 11 x64*  
-*Compiler: MSVC 19.50 (Visual Studio 2026), C++20, `/O2 /permissive-` Release build*  
-*Timing Methodology: Per-operation latencies are sampled directly with hardware timestamp counters using `_mm_lfence() + __rdtsc()` serialized probes, calibrated against a high-resolution timer. Both mean and percentiles (`p50`, `p95`, `p99`, `max`) are derived from the exact same raw sample array after sorting. Throughput (M ops/sec) is measured independently in uninstrumented bulk execution loops to eliminate probe overhead.*
+### Benchmark Methodology
 
-| Component / Subsystem | Workload Description | Throughput | Mean Latency | p50 | p99 | Hot-Path Allocs |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Pre-Trade Risk Engine** | Single-Order Ingress Validation (100K) | **200.84 M checks/s** | 5.0 ns | 5.0 ns | 15.0 ns | **0.00 allocs** |
-| **Market Data Parser** | Yahoo JSON $\to$ `MarketEvent` (1M) | **1.25 M pkts/s** | 800.0 ns | 780.0 ns | 1200.0 ns | **0.00 allocs** |
-| **SPSC Queue Transfer** | 1P / 1C Lock-Free Ring Buffer (Push+Pop) | **33.11 M ev/s** | 25.5 ns | 26.0 ns | 29.0 ns | **0.00 allocs** |
-| **Market Data Transit** | `MarketEvent` (128B) $\to$ Ingress SPSC | **69.22 M ev/s** | 14.4 ns | 14.0 ns | 27.0 ns | **0.00 allocs** |
-| **Order Book (Flat)** | Dense Price Spread (100K Mixed ops) | **7.25 M ops/s** | 179.0 ns | 143.0 ns | 627.0 ns | **0.00 allocs\*** |
-| **Matching Engine (Map)** | Reference Engine (100K Mixed ops) | **6.92 M ops/s** | 223.0 ns | 196.0 ns | 696.0 ns | **0.00 allocs\*** |
-| **Binary Log Replay** | Raw `.hftlog` / `.mktlog` Stream Parse | **10.82 M ev/s** | 92.4 ns | 80.0 ns | 220.0 ns | **0.00 allocs** |
-| **Execution Pipeline** | Ingress $\to$ Risk $\to$ Gateway $\to$ Engine | **4.13 M ops/s** | 364.8 ns | 235.0 ns | 903.0 ns | **0.00 allocs\*** |
+- **Hardware & Environment**: 13th Gen Intel Core i5-13420H @ 2.10 GHz, 16 GB RAM, Windows 11 x64.
+- **Compiler**: MSVC 19.50 (Visual Studio 2026), C++20, `/O2 /permissive-` Release build.
+- **Invariant Hardware Timing**: Release builds were benchmarked using invariant hardware TSC timing via serialized `_mm_lfence() + __rdtsc()` instruction pairs.
+- **Empirical Calibration**: The TSC was empirically calibrated against the CPU timer at approximately 2.611 GHz on the benchmark machine.
+- **Throughput Measurement**: Throughput is measured from the complete uninstrumented bulk workload using wall-clock time (`total_ops / wall_clock_seconds`).
+- **Latency Measurement**: Latency distributions are measured separately using TSC samples.
+- **Fixed-Size Sampling Window**: For large workloads (such as 1,000,000 operations), latency sampling uses a fixed-size sample window (e.g. 100,000 samples) rather than instrumenting every single operation, keeping measurement probe overhead bounded and comparable across scales.
+- **Single-Source Distribution**: Percentiles (`p50`, `p95`, `p99`, `p99.9`, `max`) and `mean` are calculated from the exact same sampled latency array after sorting.
+- **OS Scheduling Noise**: Maximum latency can contain normal OS scheduling/interruption noise and should not be interpreted as steady-state engine latency.
+- **Environment Dependency**: Results are machine- and run-dependent and are not claims about production exchange performance.
 
-*\* In OrderBook implementations, preallocated `OrderPool` recycling eliminates order heap allocation. The aggressive match, order cancellation, pre-trade risk validation, and SPSC ring buffers are verified 100% zero-allocation hot paths. In reference books, node allocations for resting limit orders are bounded strictly to std::unordered_map order lookup.*
+---
+
+### 1. Order Book & Matching Engine (`hft_benchmark.exe`)
+
+*Comparing Reference `MatchingEngine` (std::map) vs `FlatMatchingEngine` (Contiguous Sorted Vector)*  
+*Format: [Map] / [Flat] — Derived from the same raw TSC sample array*
+
+| Workload | Scale | p50 | p95 | p99 | p99.9 | Mean | Allocs/Op | Throughput (M ops/s) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **ADD-HEAVY** | 10,000 | 110 / 94 ns | 163 / 219 ns | 206 / 330 ns | 4689 / 5169 ns | 121 / 115 ns | 1.13 -> 1.00 | 4.40 -> 8.53 (+93.7%) |
+| **MATCH-HEAVY** | 10,000 | 65 / 55 ns | 127 / 121 ns | 170 / 192 ns | 497 / 687 ns | 70 / 64 ns | 0.81 -> 0.50 | 16.58 -> 19.29 (+16.4%) |
+| **CANCEL-HEAVY**| 10,000 | 114 / 88 ns | 185 / 124 ns | 266 / 166 ns | 1078 / 417 ns | 126 / 91 ns | 0.98 -> 0.50 | 10.14 -> 12.87 (+26.9%) |
+| **MIXED** | 10,000 | 75 / 70 ns | 183 / 173 ns | 247 / 238 ns | 602 / 553 ns | 79 / 75 ns | 0.63 -> 0.40 | 14.53 -> 17.19 (+18.3%) |
+| **ADD-HEAVY** | 100,000 | 126 / 244 ns | 249 / 641 ns | 389 / 864 ns | 847 / 4790 ns | 162 / 356 ns | 1.00 -> 1.00 | 6.74 -> 7.21 (+7.0%) |
+| **MATCH-HEAVY** | 100,000 | 92 / 59 ns | 298 / 143 ns | 496 / 213 ns | 883 / 513 ns | 129 / 74 ns | 0.81 -> 0.50 | 9.91 -> 17.83 (+80.0%) |
+| **CANCEL-HEAVY**| 100,000 | 117 / 101 ns | 186 / 176 ns | 274 / 314 ns | 576 / 569 ns | 129 / 117 ns | 0.96 -> 0.50 | 9.34 -> 11.08 (+18.7%) |
+| **MIXED** | 100,000 | 76 / 73 ns | 190 / 205 ns | 275 / 336 ns | 546 / 624 ns | 84 / 89 ns | 0.61 -> 0.39 | 12.52 -> 14.55 (+16.2%) |
+| **ADD-HEAVY** | 1,000,000 | 153 / 149 ns | 327 / 228 ns | 536 / 490 ns | 965 / 4044 ns | 193 / 185 ns | 1.00 -> 1.00 | 3.81 -> 4.50 (+18.3%) |
+| **MATCH-HEAVY** | 1,000,000 | 150 / 140 ns | 253 / 235 ns | 492 / 479 ns | 1155 / 1091 ns | 158 / 148 ns | 0.81 -> 0.50 | 6.63 -> 6.60 (-0.4%) |
+| **CANCEL-HEAVY**| 1,000,000 | 149 / 121 ns | 232 / 199 ns | 452 / 424 ns | 847 / 791 ns | 158 / 133 ns | 0.96 -> 0.50 | 6.22 -> 6.66 (+7.1%) |
+| **MIXED** | 1,000,000 | 143 / 138 ns | 318 / 296 ns | 510 / 490 ns | 1157 / 1254 ns | 140 / 135 ns | 0.61 -> 0.39 | 7.26 -> 8.05 (+10.9%) |
+
+---
+
+### 2. Market Data Decoder & SPSC Benchmark (`market_data_benchmark.exe`)
+
+*Protocol: Angel One SmartStream Binary | MarketEvent: 128 bytes (2 cache lines)*
+
+#### Hot-Path Allocation Verification
+- **Decode + SPSC push/pop (50,000 ops)**: **0 heap allocations** (Verified Zero Dynamic Allocations).
+
+#### Scale: 100,000 Packets
+- **Decoder Throughput**: **19.21 M packets/s**
+- **Decoder Latency (TSC, per-op samples)**:
+  - Mean: **47.0 ns** | p50: **22.0 ns** | p95: **127.0 ns** | p99: **189.0 ns** | p99.9: **480.0 ns** | Max: **87790.0 ns**
+- **SPSC Push Throughput**: **80.34 M events/s**
+- **SPSC Push+Pop Latency**:
+  - Mean: **8.5 ns** | p50: **9.0 ns** | p95: **9.0 ns** | p99: **9.0 ns** | p99.9: **17.0 ns** | Max: **265.0 ns**
+- **Binary Logging (.mktlog)**:
+  - Record: **3.58 M ev/s**
+  - Replay: **18.93 M ev/s**
+
+#### Scale: 1,000,000 Packets
+- **Decoder Throughput**: **19.25 M packets/s**
+- **Decoder Latency (TSC, 100,000-sample window)**:
+  - Mean: **44.7 ns** | p50: **21.0 ns** | p95: **127.0 ns** | p99: **202.0 ns** | p99.9: **485.0 ns** | Max: **27505.0 ns**
+- **SPSC Push Throughput**: **88.61 M events/s**
+- **SPSC Push+Pop Latency**:
+  - Mean: **8.2 ns** | p50: **8.0 ns** | p95: **9.0 ns** | p99: **9.0 ns** | p99.9: **16.0 ns** | Max: **12694.0 ns**
+- **Binary Logging (.mktlog)**:
+  - Record: **3.14 M ev/s**
+  - Replay: **28.37 M ev/s**
+
+> [!NOTE]
+> **Fixed-Window Sampling Disclosure**: The 1,000,000-packet decoder benchmark intentionally reports latency from a fixed 100,000-sample measurement window rather than instrumenting all 1,000,000 operations. Throughput measures the complete uninstrumented workload, while latency sampling uses a fixed-size sample window to keep measurement overhead bounded and comparable across scales. 1,000,000 latency samples were not collected.
+
+---
+
+### 3. SPSC Lock-Free Queue Benchmark (`queue_benchmark.exe`)
+
+*Concurrent 1 Producer / 1 Consumer Transfer (2,000,000 Events)*
+
+#### Allocation Verification
+- **Operations Tested**: 200,000 (100k push + 100k pop)
+- **Dynamic Allocations**: **0** | **Dynamic Deallocations**: **0** (0.00 allocs/event).
+
+#### Throughput & Amortized Period by Capacity
+| Queue Type | Capacity | Throughput (M ev/s) | Amortized Period (ns) |
+| :--- | :--- | :--- | :--- |
+| **SPSC (Cache-Aligned)** | 256 | **40.61 M ev/s** | 24.6 ns |
+| **SPSC (Unaligned)** | 256 | **31.80 M ev/s** | 31.4 ns |
+| **std::mutex + queue** | 256 | **15.00 M ev/s** | 66.7 ns |
+| **SPSC (Cache-Aligned)** | 1,024 | **41.12 M ev/s** | 24.3 ns |
+| **SPSC (Unaligned)** | 1,024 | **26.18 M ev/s** | 38.2 ns |
+| **std::mutex + queue** | 1,024 | **15.47 M ev/s** | 64.7 ns |
+| **SPSC (Cache-Aligned)** | 4,096 | **36.96 M ev/s** | 27.1 ns |
+| **SPSC (Unaligned)** | 4,096 | **24.58 M ev/s** | 40.7 ns |
+| **std::mutex + queue** | 4,096 | **13.69 M ev/s** | 73.0 ns |
+| **SPSC (Cache-Aligned)** | 16,384 | **46.01 M ev/s** | 21.7 ns |
+| **SPSC (Unaligned)** | 16,384 | **28.92 M ev/s** | 34.6 ns |
+| **std::mutex + queue** | 16,384 | **13.42 M ev/s** | 74.5 ns |
+
+#### CPU Thread Affinity Experiment (Capacity 4,096, 2M Events)
+- **Unpinned Scheduling**: **40.45 M events/s**
+- **Pinned Scheduling**: **42.15 M events/s**
+- **Observed Affinity Impact**: **+4.2%** *(Note: This is an observed result from this benchmark run, not a universal guarantee across all environments).*
+
+---
+
+### 4. End-to-End Execution Pipeline Benchmark (`execution_pipeline_benchmark.exe`)
+
+*Pipeline: OrderCommand (64B) -> PreTradeRisk -> OrderGateway -> MatchingEngine -> ExecutionReport (64B)*
+
+#### Dynamic Heap Allocation Audit Across Pipeline Stages
+- **[1. Pre-Trade Risk Engine Hot Path]**: **0 allocations** (0.000 allocs/check) -> **Verified Zero Heap Allocations**
+- **[2. Risk-Rejected Orders (Gateway -> ExecutionReport)]**: **0 allocations** (0.000 allocs/order) -> **Verified Zero Heap Allocations**
+- **[3. SPSC Queue Ingress & Egress Transfers]**: **0 allocations** (0.000 allocs/op) -> **Verified Zero Heap Allocations**
+- **[4. Order Cancellation Hot Path]**: **0 allocations** (0.000 allocs/cancel) -> **Verified Zero Heap Allocations**
+- **[5. Aggressive Crossing Matches (Immediate Fills)]**: **2 total allocations**
+- **[6. Reference Engine Book Insertion (order_lookup_)]**: **50,100 allocations / 50,000 orders** = **1.002 allocs/order** *(due to `std::unordered_map` node allocation in the reference OrderBook)*
+
+> [!WARNING]
+> The entire MatchingEngine pipeline is **not universally zero-allocation**: while risk checking, risk rejection, SPSC queue transport, and order cancellations are strictly 100% zero-allocation, resting limit order insertions in the reference OrderBook allocate `std::unordered_map` bucket nodes (1 node per resting order).
+
+#### Scale: 100,000 Orders / Events
+- **Benchmark A (Pre-Trade Risk Check Only)**: **215.29 M checks/s** (4.6 ns/check amortized)
+- **Benchmark B (Resting Orders: Risk + Gateway + Matching)**: **5.91 M orders/s** (169.2 ns/order amortized)
+- **Benchmark C (Match-Heavy Execution: Crossing Orders)**: **10.96 M orders/s** (91.2 ns/order amortized, 50,000 trades)
+- **Benchmark D (Mixed Workload: 60% Adds, 25% Cancels, 15% Crosses)**: **9.55 M ops/s** (104.7 ns/op amortized)
+- **Benchmark E (TSC-Sampled Latency Distribution, 100,000 samples)**:
+  - Mean: **123.1 ns** | p50: **64.0 ns** | p95: **196.0 ns** | p99: **350.0 ns** | p99.9: **826.0 ns** | Max: **381725.0 ns**
+
+#### Scale: 1,000,000 Orders / Events
+- **Benchmark A (Pre-Trade Risk Check Only)**: **227.50 M checks/s** (4.4 ns/check amortized)
+- **Benchmark B (Resting Orders: Risk + Gateway + Matching)**: **3.83 M orders/s** (261.4 ns/order amortized)
+- **Benchmark C (Match-Heavy Execution: Crossing Orders)**: **4.67 M orders/s** (214.1 ns/order amortized)
+- **Benchmark D (Mixed Workload: 60% Adds, 25% Cancels, 15% Crosses)**: **3.72 M ops/s** (269.0 ns/op amortized)
 
 ---
 
@@ -169,7 +283,7 @@ Stocks/
 
 ```
 ==================================================
- TEST SUMMARY: 81 / 81 PASS (0 Failures, ~680 ms)
+ TEST SUMMARY: 83 / 83 PASS (0 Failures, ~460 ms)
 ==================================================
 ```
 

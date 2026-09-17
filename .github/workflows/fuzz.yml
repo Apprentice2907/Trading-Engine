@@ -3,6 +3,13 @@ name: Decoder Mutation Fuzzing
 on:
   push:
     paths:
+      - 'include/hft/market_data.hpp'
+      - 'src/market_data.cpp'
+      - 'src/yahoo_market_data.cpp'
+      - 'src/angel_client.cpp'
+      - 'tests/fuzz_decoder.cpp'
+      - 'tests/corpus/**'
+      - 'CMakeLists.txt'
       - '.github/workflows/fuzz.yml'
   workflow_dispatch:
 
